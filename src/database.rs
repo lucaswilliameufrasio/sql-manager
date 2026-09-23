@@ -62,6 +62,7 @@ impl DatabaseSession {
             let runtime = match Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    password.zeroize();
                     let _ = event_sender.send(Event::Disconnected(format!(
                         "Could not start the async runtime: {error}"
                     )));
@@ -78,6 +79,7 @@ impl DatabaseSession {
             {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
+                    password.zeroize();
                     let _ = event_sender.send(Event::Disconnected(error));
                     return;
                 }
@@ -90,6 +92,7 @@ impl DatabaseSession {
                 ))) {
                     Ok(stream) => stream,
                     Err(error) => {
+                        password.zeroize();
                         let _ = event_sender.send(Event::Disconnected(format!(
                             "Could not connect through the SSH tunnel: {error}"
                         )));

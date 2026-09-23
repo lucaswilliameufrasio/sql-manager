@@ -1226,7 +1226,7 @@ impl SqlManagerApp {
                 return;
             }
         };
-        let password = if self.draft.password.is_empty() {
+        let mut password = if self.draft.password.is_empty() {
             match secrets::load_password(profile.id) {
                 Ok(Some(password)) => password,
                 Ok(None) => String::new(),
@@ -1253,6 +1253,7 @@ impl SqlManagerApp {
                 },
                 Err(error) => format!("Could not start the async runtime: {error}"),
             };
+            password.zeroize();
             let _ = sender.send(message);
             context.request_repaint();
         });
