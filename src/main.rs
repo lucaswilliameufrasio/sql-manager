@@ -1,6 +1,7 @@
 mod backup;
 mod connection;
 mod database;
+mod schema;
 mod secrets;
 mod storage;
 
@@ -14,6 +15,7 @@ use connection::{ConnectionDraft, ConnectionProfile, TlsMode, test_connection};
 use database::{DatabaseSession, Event as DatabaseEvent, QueryOutput};
 use eframe::egui;
 use rfd::FileDialog;
+use schema::{EditedCell, TableData, delete_sql, insert_sql, update_sql};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -41,6 +43,10 @@ struct SqlManagerApp {
     sql: String,
     query_result: Option<QueryOutput>,
     query_running: bool,
+    current_table: Option<TableData>,
+    table_loading: bool,
+    row_editor: Option<RowEditor>,
+    pending_delete_row: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +59,16 @@ struct BackupDialog {
     action: BackupAction,
     password: String,
     confirmation: String,
+}
+
+enum RowEditorMode {
+    Insert,
+    Update { original: Vec<Option<String>> },
+}
+
+struct RowEditor {
+    mode: RowEditorMode,
+    cells: Vec<EditedCell>,
 }
 
 impl Default for SqlManagerApp {
@@ -79,6 +95,10 @@ impl Default for SqlManagerApp {
             sql: String::from("SELECT current_database(), current_user;"),
             query_result: None,
             query_running: false,
+            current_table: None,
+            table_loading: false,
+            row_editor: None,
+            pending_delete_row: None,
         }
     }
 }
@@ -150,20 +170,39 @@ impl eframe::App for SqlManagerApp {
                     if let Some(schema) = requested_schema {
                         self.selected_schema = Some(schema.clone());
                         self.tables.clear();
+                        self.current_table = None;
                         if let Some(session) = &self.session {
                             let _ = session.list_tables(schema);
                         }
                     }
 
+                    let mut requested_table = None;
                     for table in &self.tables {
-                        if ui.button(table).clicked()
-                            && let Some(schema) = &self.selected_schema
+                        if ui
+                            .selectable_label(
+                                self.current_table.as_ref().is_some_and(|current| {
+                                    current.name == *table
+                                        && Some(current.schema.as_str())
+                                            == self.selected_schema.as_deref()
+                                }),
+                                table,
+                            )
+                            .clicked()
                         {
-                            self.sql = format!(
-                                "SELECT * FROM {}.{} LIMIT 100;",
-                                quote_identifier(schema),
-                                quote_identifier(table)
-                            );
+                            requested_table = Some(table.clone());
+                        }
+                    }
+                    if let Some(table) = requested_table
+                        && let Some(schema) = self.selected_schema.clone()
+                    {
+                        self.sql = format!(
+                            "SELECT * FROM {}.{} LIMIT 100;",
+                            schema::quote_identifier(&schema),
+                            schema::quote_identifier(&table)
+                        );
+                        self.table_loading = true;
+                        if let Some(session) = &self.session {
+                            let _ = session.load_table(schema, table, 0);
                         }
                     }
                 }
@@ -299,6 +338,8 @@ impl eframe::App for SqlManagerApp {
                         }
                     });
                 }
+
+                self.show_table_data(ui);
             }
 
             ui.add_space(12.0);
@@ -307,6 +348,8 @@ impl eframe::App for SqlManagerApp {
         });
 
         self.show_backup_dialog(ui.ctx());
+        self.show_row_editor(ui.ctx());
+        self.show_delete_confirmation(ui.ctx());
     }
 }
 
@@ -357,6 +400,15 @@ impl SqlManagerApp {
                         self.tables = tables;
                     }
                 }
+                DatabaseEvent::TableData(Ok(table)) => {
+                    self.table_loading = false;
+                    self.status = format!("Loaded {}.{}", table.schema, table.name);
+                    self.current_table = Some(table);
+                }
+                DatabaseEvent::TableData(Err(error)) => {
+                    self.table_loading = false;
+                    self.status = format!("Could not load table: {error}");
+                }
                 DatabaseEvent::Query(Ok(result)) => {
                     self.query_running = false;
                     self.status = result.summary.clone();
@@ -373,9 +425,277 @@ impl SqlManagerApp {
                     self.tables.clear();
                     self.selected_schema = None;
                     self.query_running = false;
+                    self.table_loading = false;
+                    self.current_table = None;
                     self.status = format!("Disconnected: {error}");
                 }
             }
+        }
+    }
+
+    fn show_table_data(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Table data");
+        if self.table_loading {
+            ui.label("Loading table data…");
+        }
+
+        let Some(table) = self.current_table.clone() else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(format!("{}.{}", table.schema, table.name));
+            if ui.button("Reload").clicked() {
+                self.request_table_page(table.offset);
+            }
+            if ui.button("Insert row").clicked() {
+                self.row_editor = Some(RowEditor {
+                    mode: RowEditorMode::Insert,
+                    cells: table
+                        .columns
+                        .iter()
+                        .map(|_column| EditedCell {
+                            use_default: true,
+                            ..EditedCell::default()
+                        })
+                        .collect(),
+                });
+            }
+            if table.primary_key.is_empty() {
+                ui.label("Rows are read-only because this table has no primary key.");
+            }
+        });
+
+        let mut edit_row = None;
+        let mut delete_row = None;
+        egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
+            egui::Grid::new("table_data_grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    for column in &table.columns {
+                        ui.strong(format!("{} ({})", column.name, column.data_type));
+                    }
+                    if !table.primary_key.is_empty() {
+                        ui.strong("Actions");
+                    }
+                    ui.end_row();
+
+                    for (index, row) in table.rows.iter().enumerate() {
+                        for value in row {
+                            ui.label(value.as_deref().unwrap_or("NULL"));
+                        }
+                        if !table.primary_key.is_empty() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Edit").clicked() {
+                                    edit_row = Some(index);
+                                }
+                                if ui.small_button("Delete").clicked() {
+                                    delete_row = Some(index);
+                                }
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+        let mut new_offset = None;
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Rows {}–{}",
+                table.offset + 1,
+                table.offset + table.rows.len() as u64
+            ));
+            if ui
+                .add_enabled(table.offset > 0, egui::Button::new("Previous"))
+                .clicked()
+            {
+                new_offset = Some(table.offset.saturating_sub(schema::TABLE_PAGE_SIZE as u64));
+            }
+            if ui
+                .add_enabled(table.has_more, egui::Button::new("Next"))
+                .clicked()
+            {
+                new_offset = Some(table.offset + schema::TABLE_PAGE_SIZE as u64);
+            }
+        });
+
+        if let Some(offset) = new_offset {
+            self.request_table_page(offset);
+        }
+        if let Some(index) = edit_row
+            && let Some(table) = &self.current_table
+            && let Some(original) = table.rows.get(index)
+        {
+            self.row_editor = Some(RowEditor {
+                mode: RowEditorMode::Update {
+                    original: original.clone(),
+                },
+                cells: original
+                    .iter()
+                    .map(|value| EditedCell {
+                        value: value.clone().unwrap_or_default(),
+                        is_null: value.is_none(),
+                        use_default: false,
+                    })
+                    .collect(),
+            });
+        }
+        if let Some(index) = delete_row {
+            self.pending_delete_row = Some(index);
+        }
+    }
+
+    fn request_table_page(&mut self, offset: u64) {
+        let Some(table) = &self.current_table else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        match session.load_table(table.schema.clone(), table.name.clone(), offset) {
+            Ok(()) => self.table_loading = true,
+            Err(error) => self.status = format!("Could not load table page: {error}"),
+        }
+    }
+
+    fn show_row_editor(&mut self, context: &egui::Context) {
+        let (Some(editor), Some(table)) = (&mut self.row_editor, &self.current_table) else {
+            return;
+        };
+
+        let title = match editor.mode {
+            RowEditorMode::Insert => "Insert row",
+            RowEditorMode::Update { .. } => "Edit row",
+        };
+        let mut close = false;
+        let mut save = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .show(context, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        for (column, cell) in table.columns.iter().zip(&mut editor.cells) {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} ({})", column.name, column.data_type));
+                                if matches!(&editor.mode, RowEditorMode::Insert)
+                                    || column.default.is_some()
+                                {
+                                    ui.checkbox(&mut cell.use_default, "DEFAULT");
+                                }
+                                if column.nullable && !cell.use_default {
+                                    ui.checkbox(&mut cell.is_null, "NULL");
+                                }
+                                if !cell.use_default && !cell.is_null {
+                                    ui.text_edit_singleline(&mut cell.value);
+                                }
+                            });
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Save row").clicked() {
+                        save = true;
+                    }
+                });
+            });
+
+        if save {
+            let sql = match &editor.mode {
+                RowEditorMode::Insert => Ok(insert_sql(
+                    &table.schema,
+                    &table.name,
+                    &table.columns,
+                    &editor.cells,
+                )),
+                RowEditorMode::Update { original } => update_sql(
+                    &table.schema,
+                    &table.name,
+                    &table.columns,
+                    &table.primary_key,
+                    original,
+                    &editor.cells,
+                ),
+            };
+            match sql {
+                Ok(sql) => self.submit_table_mutation(sql),
+                Err(error) => self.status = error,
+            }
+            close = true;
+        }
+        if close {
+            self.row_editor = None;
+        }
+    }
+
+    fn show_delete_confirmation(&mut self, context: &egui::Context) {
+        let (Some(index), Some(table)) = (self.pending_delete_row, &self.current_table) else {
+            return;
+        };
+
+        let mut cancel = false;
+        let mut confirm = false;
+        egui::Window::new("Delete row?")
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(format!(
+                    "Delete row {} from {}.{}?",
+                    index + 1,
+                    table.schema,
+                    table.name
+                ));
+                ui.label("This operation cannot be undone.");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Delete").clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+
+        if confirm && let Some(row) = table.rows.get(index) {
+            match delete_sql(
+                &table.schema,
+                &table.name,
+                &table.columns,
+                &table.primary_key,
+                row,
+            ) {
+                Ok(sql) => self.submit_table_mutation(sql),
+                Err(error) => self.status = error,
+            }
+            self.pending_delete_row = None;
+        } else if cancel {
+            self.pending_delete_row = None;
+        }
+    }
+
+    fn submit_table_mutation(&mut self, sql: String) {
+        let Some(table) = &self.current_table else {
+            return;
+        };
+        let schema = table.schema.clone();
+        let name = table.name.clone();
+        let offset = table.offset;
+        let Some(session) = &self.session else {
+            return;
+        };
+        match session.execute(sql) {
+            Ok(()) => {
+                self.query_running = true;
+                self.table_loading = true;
+                let _ = session.load_table(schema, name, offset);
+                self.status = String::from("Saving row…");
+            }
+            Err(error) => self.status = format!("Could not submit row change: {error}"),
         }
     }
 
@@ -606,23 +926,5 @@ impl SqlManagerApp {
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-    }
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::quote_identifier;
-
-    #[test]
-    fn quotes_identifiers_without_interpreting_sql() {
-        assert_eq!(quote_identifier("public"), "\"public\"");
-        assert_eq!(
-            quote_identifier("items\"; DROP TABLE users; --"),
-            "\"items\"\"; DROP TABLE users; --\""
-        );
     }
 }
