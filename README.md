@@ -11,7 +11,8 @@ Install the Rust toolchain, then run the desktop application with:
 cargo run
 ```
 
-The current bootstrap opens the native egui window. The initial milestones are
-PostgreSQL connections (including SSL and SSH tunneling), encrypted connection
-backup and restore, schema browsing, SQL execution, and visual data/schema
-management. macOS and Linux are the initial target platforms.
+The app currently supports saved PostgreSQL connection profiles, system-keyring
+password storage, and asynchronous connection tests over verified TLS by default.
+The remaining milestones include SSH tunneling, encrypted connection backup and
+restore, schema browsing, SQL execution, and visual data/schema management.
+macOS and Linux are the initial target platforms.
