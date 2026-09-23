@@ -6,12 +6,15 @@ use std::{
 
 use futures_util::TryStreamExt;
 use tokio::runtime::Runtime;
-use tokio_postgres::{Client, Config, SimpleQueryMessage, config::SslMode};
+use tokio_postgres::{Client, Config, SimpleQueryMessage, config::SslMode, tls::MakeTlsConnect};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use zeroize::Zeroize;
 
-use crate::connection::{ConnectionProfile, TlsMode};
 use crate::schema::{ColumnInfo, TABLE_PAGE_SIZE, TableData, quote_identifier};
+use crate::{
+    connection::{ConnectionProfile, TlsMode},
+    ssh_tunnel::SshTunnel,
+};
 
 const MAX_RESULT_ROWS: usize = 1_000;
 
@@ -67,31 +70,72 @@ impl DatabaseSession {
             };
 
             let config = build_config(&profile, &password);
+            let mut tunnel = match profile
+                .ssh_tunnel
+                .as_ref()
+                .map(|ssh| SshTunnel::start(ssh, &profile.host, profile.port))
+                .transpose()
+            {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    let _ = event_sender.send(Event::Disconnected(error));
+                    return;
+                }
+            };
             let tls_disabled = profile.tls_mode == TlsMode::Disable;
-            if tls_disabled {
+            if let Some(tunnel_ref) = tunnel.as_ref() {
+                let stream = match runtime.block_on(tokio::net::TcpStream::connect((
+                    "127.0.0.1",
+                    tunnel_ref.local_port,
+                ))) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let _ = event_sender.send(Event::Disconnected(format!(
+                            "Could not connect through the SSH tunnel: {error}"
+                        )));
+                        return;
+                    }
+                };
+
+                if tls_disabled {
+                    let result =
+                        runtime.block_on(config.connect_raw(stream, tokio_postgres::NoTls));
+                    password.zeroize();
+                    handle_connection_result(
+                        runtime,
+                        result,
+                        command_receiver,
+                        event_sender,
+                        tunnel.take(),
+                    );
+                } else {
+                    let _ = rustls::crypto::ring::default_provider().install_default();
+                    let mut tls = MakeRustlsConnect::with_webpki_roots();
+                    let connector = <MakeRustlsConnect as MakeTlsConnect<tokio::net::TcpStream>>::make_tls_connect(
+                        &mut tls,
+                        &profile.host,
+                    )
+                        .expect("Rustls TLS connector is infallible");
+                    let result = runtime.block_on(config.connect_raw(stream, connector));
+                    password.zeroize();
+                    handle_connection_result(
+                        runtime,
+                        result,
+                        command_receiver,
+                        event_sender,
+                        tunnel.take(),
+                    );
+                }
+            } else if tls_disabled {
                 let result = runtime.block_on(config.connect(tokio_postgres::NoTls));
                 password.zeroize();
-                match result {
-                    Ok((client, connection)) => {
-                        run_session(runtime, client, connection, command_receiver, event_sender)
-                    }
-                    Err(error) => {
-                        let _ = event_sender.send(Event::Disconnected(error.to_string()));
-                    }
-                }
+                handle_connection_result(runtime, result, command_receiver, event_sender, tunnel);
             } else {
                 let _ = rustls::crypto::ring::default_provider().install_default();
                 let result =
                     runtime.block_on(config.connect(MakeRustlsConnect::with_webpki_roots()));
                 password.zeroize();
-                match result {
-                    Ok((client, connection)) => {
-                        run_session(runtime, client, connection, command_receiver, event_sender)
-                    }
-                    Err(error) => {
-                        let _ = event_sender.send(Event::Disconnected(error.to_string()));
-                    }
-                }
+                handle_connection_result(runtime, result, command_receiver, event_sender, tunnel);
             }
         });
 
@@ -147,6 +191,7 @@ fn run_session<C>(
     connection: C,
     commands: Receiver<Command>,
     events: Sender<Event>,
+    _tunnel: Option<SshTunnel>,
 ) where
     C: Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
 {
@@ -197,6 +242,25 @@ fn run_session<C>(
             }
         }
     });
+}
+
+fn handle_connection_result<C>(
+    runtime: Runtime,
+    result: Result<(Client, C), tokio_postgres::Error>,
+    commands: Receiver<Command>,
+    events: Sender<Event>,
+    tunnel: Option<SshTunnel>,
+) where
+    C: Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
+    match result {
+        Ok((client, connection)) => {
+            run_session(runtime, client, connection, commands, events, tunnel)
+        }
+        Err(error) => {
+            let _ = events.send(Event::Disconnected(error.to_string()));
+        }
+    }
 }
 
 async fn load_table(

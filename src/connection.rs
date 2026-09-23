@@ -1,9 +1,19 @@
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{Client, Config, config::SslMode};
+use tokio_postgres::{Client, Config, config::SslMode, tls::MakeTlsConnect};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
+
+use crate::ssh_tunnel::SshTunnel;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SshTunnelConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub identity_file: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConnectionProfile {
@@ -14,6 +24,8 @@ pub struct ConnectionProfile {
     pub database: String,
     pub username: String,
     pub tls_mode: TlsMode,
+    #[serde(default)]
+    pub ssh_tunnel: Option<SshTunnelConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -53,6 +65,11 @@ pub struct ConnectionDraft {
     pub username: String,
     pub password: String,
     pub tls_mode: TlsMode,
+    pub ssh_enabled: bool,
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_username: String,
+    pub ssh_identity_file: String,
 }
 
 impl Default for ConnectionDraft {
@@ -65,6 +82,11 @@ impl Default for ConnectionDraft {
             username: String::new(),
             password: String::new(),
             tls_mode: TlsMode::default(),
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: String::from("22"),
+            ssh_username: String::new(),
+            ssh_identity_file: String::new(),
         }
     }
 }
@@ -79,6 +101,23 @@ impl ConnectionDraft {
             username: profile.username.clone(),
             password: String::new(),
             tls_mode: profile.tls_mode,
+            ssh_enabled: profile.ssh_tunnel.is_some(),
+            ssh_host: profile
+                .ssh_tunnel
+                .as_ref()
+                .map_or_else(String::new, |ssh| ssh.host.clone()),
+            ssh_port: profile
+                .ssh_tunnel
+                .as_ref()
+                .map_or_else(|| String::from("22"), |ssh| ssh.port.to_string()),
+            ssh_username: profile
+                .ssh_tunnel
+                .as_ref()
+                .map_or_else(String::new, |ssh| ssh.username.clone()),
+            ssh_identity_file: profile
+                .ssh_tunnel
+                .as_ref()
+                .map_or_else(String::new, |ssh| ssh.identity_file.clone()),
         }
     }
 
@@ -98,6 +137,33 @@ impl ConnectionDraft {
                 "Name, host, database, and username are required",
             ));
         }
+        if port == 0 {
+            return Err(String::from("Port must be greater than 0"));
+        }
+
+        let ssh_tunnel = if self.ssh_enabled {
+            let ssh_host = self.ssh_host.trim();
+            let ssh_username = self.ssh_username.trim();
+            let ssh_port = self
+                .ssh_port
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| String::from("SSH port must be a number between 1 and 65535"))?;
+            if ssh_port == 0 {
+                return Err(String::from("SSH port must be greater than 0"));
+            }
+            if ssh_host.is_empty() || ssh_username.is_empty() {
+                return Err(String::from("SSH host and username are required"));
+            }
+            Some(SshTunnelConfig {
+                host: ssh_host.to_owned(),
+                port: ssh_port,
+                username: ssh_username.to_owned(),
+                identity_file: self.ssh_identity_file.trim().to_owned(),
+            })
+        } else {
+            None
+        };
 
         Ok(ConnectionProfile {
             id: existing_id.unwrap_or_else(Uuid::new_v4),
@@ -107,6 +173,7 @@ impl ConnectionDraft {
             database: database.to_owned(),
             username: username.to_owned(),
             tls_mode: self.tls_mode,
+            ssh_tunnel,
         })
     }
 }
@@ -114,7 +181,12 @@ impl ConnectionDraft {
 pub async fn test_connection(
     profile: &ConnectionProfile,
     password: &str,
-) -> Result<String, tokio_postgres::Error> {
+) -> Result<String, String> {
+    let tunnel = profile
+        .ssh_tunnel
+        .as_ref()
+        .map(|ssh| SshTunnel::start(ssh, &profile.host, profile.port))
+        .transpose()?;
     let mut config = Config::new();
     config
         .host(&profile.host)
@@ -127,11 +199,54 @@ pub async fn test_connection(
     if profile.tls_mode != TlsMode::Disable {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls = MakeRustlsConnect::with_webpki_roots();
-        let (client, connection) = config.connect(tls).await?;
-        verify_server(client, connection).await
+        if let Some(tunnel) = &tunnel {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", tunnel.local_port))
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut tls = MakeRustlsConnect::with_webpki_roots();
+            let connector =
+                <MakeRustlsConnect as MakeTlsConnect<tokio::net::TcpStream>>::make_tls_connect(
+                    &mut tls,
+                    &profile.host,
+                )
+                .expect("Rustls TLS connector is infallible");
+            let (client, connection) = config
+                .connect_raw(stream, connector)
+                .await
+                .map_err(|error| error.to_string())?;
+            verify_server(client, connection)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            let (client, connection) = config
+                .connect(tls)
+                .await
+                .map_err(|error| error.to_string())?;
+            verify_server(client, connection)
+                .await
+                .map_err(|error| error.to_string())
+        }
     } else {
-        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-        verify_server(client, connection).await
+        if let Some(tunnel) = &tunnel {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", tunnel.local_port))
+                .await
+                .map_err(|error| error.to_string())?;
+            let (client, connection) = config
+                .connect_raw(stream, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| error.to_string())?;
+            verify_server(client, connection)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|error| error.to_string())?;
+            verify_server(client, connection)
+                .await
+                .map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -190,6 +305,32 @@ mod tests {
         };
 
         assert!(draft.to_profile(None).is_err());
+    }
+
+    #[test]
+    fn ssh_tunnel_is_optional_and_validated_when_enabled() {
+        let mut draft = ConnectionDraft {
+            name: String::from("Remote"),
+            host: String::from("db.internal"),
+            database: String::from("app"),
+            username: String::from("app_user"),
+            ..ConnectionDraft::default()
+        };
+        assert!(
+            draft
+                .to_profile(None)
+                .expect("direct connection")
+                .ssh_tunnel
+                .is_none()
+        );
+
+        draft.ssh_enabled = true;
+        assert!(draft.to_profile(None).is_err());
+        draft.ssh_host = String::from("bastion.example.com");
+        draft.ssh_username = String::from("lucas");
+        draft.ssh_identity_file = String::from("/home/user/.ssh/id_ed25519");
+        let profile = draft.to_profile(None).expect("valid SSH connection");
+        assert_eq!(profile.ssh_tunnel.expect("SSH config").port, 22);
     }
 
     #[test]

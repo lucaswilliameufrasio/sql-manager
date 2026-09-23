@@ -153,7 +153,7 @@ pub fn decrypt_profiles(
 mod tests {
     use uuid::Uuid;
 
-    use crate::connection::{ConnectionProfile, TlsMode};
+    use crate::connection::{ConnectionProfile, SshTunnelConfig, TlsMode};
 
     use super::{
         BackupPayload, BackupProfile, VERSION, decrypt_payload, decrypt_profiles, encrypt_payload,
@@ -169,6 +169,12 @@ mod tests {
             database: String::from("postgres"),
             username: String::from("postgres"),
             tls_mode: TlsMode::Require,
+            ssh_tunnel: Some(SshTunnelConfig {
+                host: String::from("bastion.example.com"),
+                port: 22,
+                username: String::from("dbuser"),
+                identity_file: String::from("~/.ssh/id_ed25519"),
+            }),
         }
     }
 
@@ -213,6 +219,15 @@ mod tests {
         assert_eq!(restored.profiles.len(), 1);
         assert_eq!(restored.profiles[0].profile.id, profile.id);
         assert_eq!(restored.profiles[0].profile.host, profile.host);
+        assert_eq!(
+            restored.profiles[0]
+                .profile
+                .ssh_tunnel
+                .as_ref()
+                .expect("restored SSH settings")
+                .host,
+            "bastion.example.com"
+        );
         assert_eq!(
             restored.profiles[0].password.as_deref(),
             Some("postgres-password")

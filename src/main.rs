@@ -4,6 +4,7 @@ mod database;
 mod schema;
 mod schema_operations;
 mod secrets;
+mod ssh_tunnel;
 mod storage;
 
 use std::{
@@ -288,6 +289,45 @@ impl eframe::App for SqlManagerApp {
                             }
                         });
                     ui.end_row();
+
+                    ui.label("SSH tunnel");
+                    ui.checkbox(&mut self.draft.ssh_enabled, "Use OpenSSH tunnel");
+                    ui.end_row();
+
+                    if self.draft.ssh_enabled {
+                        ui.label("SSH host");
+                        ui.text_edit_singleline(&mut self.draft.ssh_host);
+                        ui.end_row();
+
+                        ui.label("SSH port");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.ssh_port)
+                                .desired_width(90.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("SSH username");
+                        ui.text_edit_singleline(&mut self.draft.ssh_username);
+                        ui.end_row();
+
+                        ui.label("SSH identity");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft.ssh_identity_file)
+                                    .desired_width(220.0),
+                            );
+                            if ui.button("Browse").clicked()
+                                && let Some(path) = FileDialog::new().pick_file()
+                            {
+                                self.draft.ssh_identity_file = path.display().to_string();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.label("Uses ssh-agent or this key file; trust the SSH host key first.");
+                        ui.end_row();
+                    }
                 });
 
             ui.add_space(16.0);
