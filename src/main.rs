@@ -1,5 +1,6 @@
 mod backup;
 mod connection;
+mod database;
 mod secrets;
 mod storage;
 
@@ -10,6 +11,7 @@ use std::{
 
 use backup::{decrypt_profiles, encrypt_profiles};
 use connection::{ConnectionDraft, ConnectionProfile, TlsMode, test_connection};
+use database::{DatabaseSession, Event as DatabaseEvent, QueryOutput};
 use eframe::egui;
 use rfd::FileDialog;
 use uuid::Uuid;
@@ -32,6 +34,13 @@ struct SqlManagerApp {
     status: String,
     pending_test: Option<Receiver<String>>,
     backup_dialog: Option<BackupDialog>,
+    session: Option<DatabaseSession>,
+    schemas: Vec<String>,
+    tables: Vec<String>,
+    selected_schema: Option<String>,
+    sql: String,
+    query_result: Option<QueryOutput>,
+    query_running: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,12 +72,21 @@ impl Default for SqlManagerApp {
             status,
             pending_test: None,
             backup_dialog: None,
+            session: None,
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            selected_schema: None,
+            sql: String::from("SELECT current_database(), current_user;"),
+            query_result: None,
+            query_running: false,
         }
     }
 }
 
 impl eframe::App for SqlManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.refresh_database_events();
+
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("SQL Manager");
@@ -116,6 +134,39 @@ impl eframe::App for SqlManagerApp {
                     }
                 }
                 self.selected_profile_id = selected;
+
+                if self.session.is_some() {
+                    ui.separator();
+                    ui.heading("Schemas");
+                    let mut requested_schema = None;
+                    for schema in &self.schemas {
+                        if ui
+                            .selectable_label(self.selected_schema.as_ref() == Some(schema), schema)
+                            .clicked()
+                        {
+                            requested_schema = Some(schema.clone());
+                        }
+                    }
+                    if let Some(schema) = requested_schema {
+                        self.selected_schema = Some(schema.clone());
+                        self.tables.clear();
+                        if let Some(session) = &self.session {
+                            let _ = session.list_tables(schema);
+                        }
+                    }
+
+                    for table in &self.tables {
+                        if ui.button(table).clicked()
+                            && let Some(schema) = &self.selected_schema
+                        {
+                            self.sql = format!(
+                                "SELECT * FROM {}.{} LIMIT 100;",
+                                quote_identifier(schema),
+                                quote_identifier(table)
+                            );
+                        }
+                    }
+                }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -178,7 +229,77 @@ impl eframe::App for SqlManagerApp {
                 {
                     self.start_connection_test(ui.ctx());
                 }
+
+                if self.session.is_none() {
+                    if ui.button("Connect").clicked() {
+                        self.start_database_session();
+                    }
+                } else if ui.button("Disconnect").clicked() {
+                    self.session = None;
+                    self.schemas.clear();
+                    self.tables.clear();
+                    self.selected_schema = None;
+                    self.query_result = None;
+                    self.status = String::from("Disconnected");
+                }
             });
+
+            if self.session.is_some() {
+                ui.separator();
+                ui.heading("SQL workspace");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.sql)
+                        .code_editor()
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY),
+                );
+                if ui
+                    .add_enabled(
+                        !self.query_running && !self.sql.trim().is_empty(),
+                        egui::Button::new(if self.query_running {
+                            "Running…"
+                        } else {
+                            "Run query"
+                        }),
+                    )
+                    .clicked()
+                    && let Some(session) = &self.session
+                {
+                    match session.execute(self.sql.clone()) {
+                        Ok(()) => {
+                            self.query_running = true;
+                            self.status = String::from("Running query…");
+                        }
+                        Err(error) => self.status = format!("Could not submit query: {error}"),
+                    }
+                }
+
+                if let Some(result) = &self.query_result {
+                    ui.label(&result.summary);
+                    egui::ScrollArea::both().max_height(260.0).show(ui, |ui| {
+                        for (result_index, result_set) in result.result_sets.iter().enumerate() {
+                            ui.label(format!("Result {}", result_index + 1));
+                            egui::Grid::new(("query_result", result_index))
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for column in &result_set.columns {
+                                        ui.strong(column);
+                                    }
+                                    ui.end_row();
+                                    for row in &result_set.rows {
+                                        for value in row {
+                                            ui.label(value.as_deref().unwrap_or("NULL"));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            if result_set.truncated {
+                                ui.label("Result limited to the first 1,000 rows.");
+                            }
+                        }
+                    });
+                }
+            }
 
             ui.add_space(12.0);
             self.refresh_test_status();
@@ -190,6 +311,74 @@ impl eframe::App for SqlManagerApp {
 }
 
 impl SqlManagerApp {
+    fn start_database_session(&mut self) {
+        let profile = match self.draft.to_profile(self.selected_profile_id) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let password = if self.draft.password.is_empty() {
+            match secrets::load_password(profile.id) {
+                Ok(Some(password)) => password,
+                Ok(None) => String::new(),
+                Err(error) => {
+                    self.status =
+                        format!("Could not load password from the system keyring: {error}");
+                    return;
+                }
+            }
+        } else {
+            self.draft.password.clone()
+        };
+
+        self.schemas.clear();
+        self.tables.clear();
+        self.selected_schema = None;
+        self.query_result = None;
+        self.session = Some(DatabaseSession::connect(profile, password));
+        self.status = String::from("Connecting to PostgreSQL…");
+    }
+
+    fn refresh_database_events(&mut self) {
+        let events = self
+            .session
+            .as_ref()
+            .map(|session| session.events.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for event in events {
+            match event {
+                DatabaseEvent::Connected => self.status = String::from("Connected to PostgreSQL"),
+                DatabaseEvent::Schemas(schemas) => self.schemas = schemas,
+                DatabaseEvent::Tables { schema, tables } => {
+                    if self.selected_schema.as_deref() == Some(&schema) {
+                        self.tables = tables;
+                    }
+                }
+                DatabaseEvent::Query(Ok(result)) => {
+                    self.query_running = false;
+                    self.status = result.summary.clone();
+                    self.query_result = Some(result);
+                }
+                DatabaseEvent::Query(Err(error)) => {
+                    self.query_running = false;
+                    self.status = format!("Query failed: {error}");
+                    self.query_result = None;
+                }
+                DatabaseEvent::Disconnected(error) => {
+                    self.session = None;
+                    self.schemas.clear();
+                    self.tables.clear();
+                    self.selected_schema = None;
+                    self.query_running = false;
+                    self.status = format!("Disconnected: {error}");
+                }
+            }
+        }
+    }
+
     fn open_backup_dialog(&mut self, action: BackupAction) {
         self.backup_dialog = Some(BackupDialog {
             action,
@@ -306,11 +495,14 @@ impl SqlManagerApp {
                         self.status = format!("Backup contains an invalid connection: {error}");
                         return;
                     }
-                    if let Some(secret) = secret
-                        && let Err(error) = secrets::save_password(profile.id, &secret)
-                    {
-                        self.status = format!("Could not restore a connection password: {error}");
-                        return;
+                    if let Some(mut secret) = secret {
+                        let result = secrets::save_password(profile.id, &secret);
+                        secret.zeroize();
+                        if let Err(error) = result {
+                            self.status =
+                                format!("Could not restore a connection password: {error}");
+                            return;
+                        }
                     }
 
                     if let Some(existing) = merged.iter_mut().find(|item| item.id == profile.id) {
@@ -414,5 +606,23 @@ impl SqlManagerApp {
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
+    }
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_identifier;
+
+    #[test]
+    fn quotes_identifiers_without_interpreting_sql() {
+        assert_eq!(quote_identifier("public"), "\"public\"");
+        assert_eq!(
+            quote_identifier("items\"; DROP TABLE users; --"),
+            "\"items\"\"; DROP TABLE users; --\""
+        );
     }
 }

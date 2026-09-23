@@ -1,7 +1,7 @@
 use argon2::Argon2;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, aead::Aead, aead::KeyInit};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{connection::ConnectionProfile, secrets};
 
@@ -22,6 +22,12 @@ struct BackupPayload {
 struct BackupProfile {
     profile: ConnectionProfile,
     password: Option<String>,
+}
+
+impl Drop for BackupProfile {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
 }
 
 pub fn encrypt_profiles(profiles: &[ConnectionProfile], password: &str) -> Result<Vec<u8>, String> {
@@ -47,7 +53,7 @@ pub fn encrypt_profiles(profiles: &[ConnectionProfile], password: &str) -> Resul
 }
 
 fn encrypt_payload(payload: &BackupPayload, password: &str) -> Result<Vec<u8>, String> {
-    let plaintext = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+    let plaintext = Zeroizing::new(serde_json::to_vec(payload).map_err(|error| error.to_string())?);
 
     let mut salt = [0_u8; SALT_LENGTH];
     let mut nonce = [0_u8; NONCE_LENGTH];
@@ -139,7 +145,7 @@ pub fn decrypt_profiles(
     Ok(payload
         .profiles
         .into_iter()
-        .map(|item| (item.profile, item.password))
+        .map(|mut item| (item.profile.clone(), item.password.take()))
         .collect())
 }
 
