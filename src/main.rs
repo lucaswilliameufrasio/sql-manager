@@ -2,6 +2,7 @@ mod backup;
 mod connection;
 mod database;
 mod schema;
+mod schema_operations;
 mod secrets;
 mod storage;
 
@@ -16,6 +17,10 @@ use database::{DatabaseSession, Event as DatabaseEvent, QueryOutput};
 use eframe::egui;
 use rfd::FileDialog;
 use schema::{EditedCell, TableData, delete_sql, insert_sql, update_sql};
+use schema_operations::{
+    ColumnType, NewColumn, add_column_sql, create_table_sql, drop_column_sql, drop_table_sql,
+    rename_column_sql, rename_table_sql,
+};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -47,6 +52,8 @@ struct SqlManagerApp {
     table_loading: bool,
     row_editor: Option<RowEditor>,
     pending_delete_row: Option<usize>,
+    schema_dialog: Option<SchemaDialog>,
+    selected_column: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +76,25 @@ enum RowEditorMode {
 struct RowEditor {
     mode: RowEditorMode,
     cells: Vec<EditedCell>,
+}
+
+#[derive(Clone, Copy)]
+enum SchemaAction {
+    CreateTable,
+    RenameTable,
+    DropTable,
+    AddColumn,
+    RenameColumn,
+    DropColumn,
+}
+
+struct SchemaDialog {
+    action: SchemaAction,
+    schema: String,
+    table: String,
+    object_name: String,
+    new_name: String,
+    columns: Vec<NewColumn>,
 }
 
 impl Default for SqlManagerApp {
@@ -99,6 +125,8 @@ impl Default for SqlManagerApp {
             table_loading: false,
             row_editor: None,
             pending_delete_row: None,
+            schema_dialog: None,
+            selected_column: None,
         }
     }
 }
@@ -157,7 +185,12 @@ impl eframe::App for SqlManagerApp {
 
                 if self.session.is_some() {
                     ui.separator();
-                    ui.heading("Schemas");
+                    ui.horizontal(|ui| {
+                        ui.heading("Schemas");
+                        if self.selected_schema.is_some() && ui.small_button("+ Table").clicked() {
+                            self.open_schema_dialog(SchemaAction::CreateTable);
+                        }
+                    });
                     let mut requested_schema = None;
                     for schema in &self.schemas {
                         if ui
@@ -171,6 +204,7 @@ impl eframe::App for SqlManagerApp {
                         self.selected_schema = Some(schema.clone());
                         self.tables.clear();
                         self.current_table = None;
+                        self.selected_column = None;
                         if let Some(session) = &self.session {
                             let _ = session.list_tables(schema);
                         }
@@ -195,6 +229,7 @@ impl eframe::App for SqlManagerApp {
                     if let Some(table) = requested_table
                         && let Some(schema) = self.selected_schema.clone()
                     {
+                        self.selected_column = None;
                         self.sql = format!(
                             "SELECT * FROM {}.{} LIMIT 100;",
                             schema::quote_identifier(&schema),
@@ -350,6 +385,7 @@ impl eframe::App for SqlManagerApp {
         self.show_backup_dialog(ui.ctx());
         self.show_row_editor(ui.ctx());
         self.show_delete_confirmation(ui.ctx());
+        self.show_schema_dialog(ui.ctx());
     }
 }
 
@@ -444,6 +480,7 @@ impl SqlManagerApp {
             return;
         };
 
+        let mut requested_schema_action = None;
         ui.horizontal(|ui| {
             ui.label(format!("{}.{}", table.schema, table.name));
             if ui.button("Reload").clicked() {
@@ -464,6 +501,45 @@ impl SqlManagerApp {
             }
             if table.primary_key.is_empty() {
                 ui.label("Rows are read-only because this table has no primary key.");
+            }
+            ui.separator();
+            if ui.small_button("Rename table").clicked() {
+                requested_schema_action = Some(SchemaAction::RenameTable);
+            }
+            if ui.small_button("Drop table").clicked() {
+                requested_schema_action = Some(SchemaAction::DropTable);
+            }
+            if ui.small_button("Add column").clicked() {
+                requested_schema_action = Some(SchemaAction::AddColumn);
+            }
+            egui::ComboBox::from_id_salt("selected_column")
+                .selected_text(self.selected_column.as_deref().unwrap_or("Select column"))
+                .show_ui(ui, |ui| {
+                    for column in &table.columns {
+                        ui.selectable_value(
+                            &mut self.selected_column,
+                            Some(column.name.clone()),
+                            &column.name,
+                        );
+                    }
+                });
+            if ui
+                .add_enabled(
+                    self.selected_column.is_some(),
+                    egui::Button::new("Rename column"),
+                )
+                .clicked()
+            {
+                requested_schema_action = Some(SchemaAction::RenameColumn);
+            }
+            if ui
+                .add_enabled(
+                    self.selected_column.is_some(),
+                    egui::Button::new("Drop column"),
+                )
+                .clicked()
+            {
+                requested_schema_action = Some(SchemaAction::DropColumn);
             }
         });
 
@@ -544,6 +620,9 @@ impl SqlManagerApp {
         }
         if let Some(index) = delete_row {
             self.pending_delete_row = Some(index);
+        }
+        if let Some(action) = requested_schema_action {
+            self.open_schema_dialog(action);
         }
     }
 
@@ -676,6 +755,235 @@ impl SqlManagerApp {
         } else if cancel {
             self.pending_delete_row = None;
         }
+    }
+
+    fn open_schema_dialog(&mut self, action: SchemaAction) {
+        let current_table = self.current_table.as_ref();
+        let schema = self
+            .selected_schema
+            .clone()
+            .or_else(|| current_table.map(|table| table.schema.clone()))
+            .unwrap_or_default();
+        let table = current_table
+            .map(|table| table.name.clone())
+            .unwrap_or_default();
+        let object_name = match action {
+            SchemaAction::RenameColumn | SchemaAction::DropColumn => {
+                self.selected_column.clone().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        let columns = match action {
+            SchemaAction::CreateTable => vec![NewColumn {
+                name: String::from("id"),
+                kind: ColumnType::Integer,
+                nullable: false,
+                primary_key: true,
+            }],
+            SchemaAction::AddColumn => vec![NewColumn {
+                name: String::new(),
+                kind: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            }],
+            _ => Vec::new(),
+        };
+
+        self.schema_dialog = Some(SchemaDialog {
+            action,
+            schema,
+            table,
+            object_name,
+            new_name: String::new(),
+            columns,
+        });
+    }
+
+    fn show_schema_dialog(&mut self, context: &egui::Context) {
+        let Some(dialog) = self.schema_dialog.as_mut() else {
+            return;
+        };
+
+        let action = dialog.action;
+        let mut close = false;
+        let mut apply = false;
+        egui::Window::new(schema_action_title(action))
+            .collapsible(false)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.label(format!("Schema: {}", dialog.schema));
+                match action {
+                    SchemaAction::CreateTable => {
+                        let mut remove_column = None;
+                        ui.horizontal(|ui| {
+                            ui.label("Table name");
+                            ui.text_edit_singleline(&mut dialog.object_name);
+                        });
+                        ui.separator();
+                        let can_remove_column = dialog.columns.len() > 1;
+                        for (index, column) in dialog.columns.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut column.name);
+                                egui::ComboBox::from_id_salt(("create_column_type", index))
+                                    .selected_text(column.kind.label())
+                                    .show_ui(ui, |ui| {
+                                        for kind in ColumnType::ALL {
+                                            ui.selectable_value(
+                                                &mut column.kind,
+                                                kind,
+                                                kind.label(),
+                                            );
+                                        }
+                                    });
+                                ui.checkbox(&mut column.nullable, "Nullable");
+                                ui.checkbox(&mut column.primary_key, "Primary key");
+                                if can_remove_column && ui.small_button("−").clicked() {
+                                    remove_column = Some(index);
+                                }
+                            });
+                        }
+                        if let Some(index) = remove_column {
+                            dialog.columns.remove(index);
+                        }
+                        if ui.button("Add column").clicked() {
+                            dialog.columns.push(NewColumn {
+                                name: String::new(),
+                                kind: ColumnType::Text,
+                                nullable: true,
+                                primary_key: false,
+                            });
+                        }
+                    }
+                    SchemaAction::RenameTable | SchemaAction::RenameColumn => {
+                        let current_name = match action {
+                            SchemaAction::RenameTable => &dialog.table,
+                            SchemaAction::RenameColumn => &dialog.object_name,
+                            _ => unreachable!(),
+                        };
+                        ui.label(format!("Rename ‘{current_name}’ to:"));
+                        ui.text_edit_singleline(&mut dialog.new_name);
+                    }
+                    SchemaAction::AddColumn => {
+                        if let Some(column) = dialog.columns.first_mut() {
+                            ui.horizontal(|ui| {
+                                ui.label("Column name");
+                                ui.text_edit_singleline(&mut column.name);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Type");
+                                egui::ComboBox::from_id_salt("add_column_type")
+                                    .selected_text(column.kind.label())
+                                    .show_ui(ui, |ui| {
+                                        for kind in ColumnType::ALL {
+                                            ui.selectable_value(
+                                                &mut column.kind,
+                                                kind,
+                                                kind.label(),
+                                            );
+                                        }
+                                    });
+                                ui.checkbox(&mut column.nullable, "Nullable");
+                            });
+                        }
+                    }
+                    SchemaAction::DropTable => {
+                        ui.label(format!("Drop table ‘{}’?", dialog.table));
+                        ui.label("This cannot be undone. Dependent objects will prevent the drop.");
+                    }
+                    SchemaAction::DropColumn => {
+                        ui.label(format!(
+                            "Drop column ‘{}’ from table ‘{}’?",
+                            dialog.object_name, dialog.table
+                        ));
+                        ui.label("This cannot be undone. Dependent objects will prevent the drop.");
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    let button_label = match action {
+                        SchemaAction::DropTable | SchemaAction::DropColumn => "Confirm drop",
+                        _ => "Apply",
+                    };
+                    if ui.button(button_label).clicked() {
+                        apply = true;
+                    }
+                });
+            });
+
+        if close {
+            self.schema_dialog = None;
+        } else if apply && let Some(dialog) = self.schema_dialog.take() {
+            self.apply_schema_operation(dialog);
+        }
+    }
+
+    fn apply_schema_operation(&mut self, dialog: SchemaDialog) {
+        let sql = match dialog.action {
+            SchemaAction::CreateTable => {
+                create_table_sql(&dialog.schema, &dialog.object_name, &dialog.columns)
+            }
+            SchemaAction::RenameTable => {
+                rename_table_sql(&dialog.schema, &dialog.table, &dialog.new_name)
+            }
+            SchemaAction::DropTable => Ok(drop_table_sql(&dialog.schema, &dialog.table)),
+            SchemaAction::AddColumn => dialog
+                .columns
+                .first()
+                .ok_or_else(|| String::from("Column definition is missing"))
+                .and_then(|column| add_column_sql(&dialog.schema, &dialog.table, column)),
+            SchemaAction::RenameColumn => rename_column_sql(
+                &dialog.schema,
+                &dialog.table,
+                &dialog.object_name,
+                &dialog.new_name,
+            ),
+            SchemaAction::DropColumn => Ok(drop_column_sql(
+                &dialog.schema,
+                &dialog.table,
+                &dialog.object_name,
+            )),
+        };
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        let Some(session) = &self.session else {
+            self.status = String::from("Connect to PostgreSQL before changing the schema");
+            return;
+        };
+        if let Err(error) = session.execute(sql) {
+            self.status = format!("Could not submit schema operation: {error}");
+            return;
+        }
+
+        let schema = dialog.schema;
+        let table_to_reload = match dialog.action {
+            SchemaAction::AddColumn | SchemaAction::RenameColumn | SchemaAction::DropColumn => {
+                Some((
+                    dialog.table,
+                    self.current_table.as_ref().map_or(0, |t| t.offset),
+                ))
+            }
+            SchemaAction::RenameTable => Some((dialog.new_name, 0)),
+            SchemaAction::CreateTable | SchemaAction::DropTable => None,
+        };
+
+        let _ = session.list_tables(schema.clone());
+        self.current_table = None;
+        self.selected_column = None;
+        if let Some((table, offset)) = table_to_reload {
+            let _ = session.load_table(schema, table, offset);
+            self.table_loading = true;
+        }
+        self.status = String::from("Applying schema change…");
     }
 
     fn submit_table_mutation(&mut self, sql: String) {
@@ -926,5 +1234,16 @@ impl SqlManagerApp {
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
+    }
+}
+
+fn schema_action_title(action: SchemaAction) -> &'static str {
+    match action {
+        SchemaAction::CreateTable => "Create table",
+        SchemaAction::RenameTable => "Rename table",
+        SchemaAction::DropTable => "Drop table",
+        SchemaAction::AddColumn => "Add column",
+        SchemaAction::RenameColumn => "Rename column",
+        SchemaAction::DropColumn => "Drop column",
     }
 }

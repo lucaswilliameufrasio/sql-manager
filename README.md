@@ -16,5 +16,7 @@ password storage, asynchronous connection tests over verified TLS by default,
 encrypted connection backup and restore, a persistent SQL workspace with a
 1,000-row result cap, schema/table browsing, and paged table views with visual row
 insert, update, and delete when the table has a primary key. The remaining milestones
-include SSH tunneling and visual schema operations.
+include SSH tunneling. Visual schema operations can create, rename, and restrict-drop
+tables and add, rename, and restrict-drop columns; column types come from a fixed
+allowlist.
 macOS and Linux are the initial target platforms.
