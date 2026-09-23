@@ -2,6 +2,8 @@
 name = "sql_manager"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight native SQL client, starting with PostgreSQL"
+repository = "https://github.com/lucaswilliameufrasio/sql-manager"
 
 [dependencies]
 argon2 = "0.6.0"
@@ -21,3 +23,8 @@ tokio-postgres = "0.7.18"
 tokio-postgres-rustls = { version = "0.14.0", features = ["ring", "webpki-roots"] }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 zeroize = "1.9.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

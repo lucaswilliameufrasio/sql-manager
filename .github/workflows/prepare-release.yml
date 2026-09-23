@@ -1,0 +1,106 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (for example 0.2.0 or v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-prep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate version
+        id: version
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${RAW_VERSION#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must be semantic X.Y.Z (optionally prefixed with v)."
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Generate changelog
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: git cliff --tag "v$RELEASE_VERSION" -o CHANGELOG.md
+
+      - name: Install Rust 1.98
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.98.0
+
+      - name: Update package version and lockfile
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          content = manifest.read_text()
+          package_start = content.index("[package]")
+          next_section = content.find("\n[", package_start + 1)
+          if next_section < 0:
+              next_section = len(content)
+          section = content[package_start:next_section]
+          updated, replacements = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{os.environ["RELEASE_VERSION"]}"',
+              section,
+              count=1,
+          )
+          if replacements != 1:
+              raise SystemExit("Could not update the package version in Cargo.toml")
+          manifest.write_text(content[:package_start] + updated + content[next_section:])
+          PY
+          cargo update --workspace
+          cargo check --locked --all-targets
+
+      - name: Create release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+          BRANCH: release/v${{ steps.version.outputs.value }}-rc.${{ github.run_attempt }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md Cargo.toml Cargo.lock
+          git commit -m "chore(release): prepare for v$VERSION"
+          git push origin HEAD:"$BRANCH"
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Release v$VERSION" \
+            --body "Automated release preparation for **v$VERSION**.
+
+          After merging this PR, create and push tag v$VERSION. The Release workflow will publish macOS and Linux archives, checksums, and the shell installer."

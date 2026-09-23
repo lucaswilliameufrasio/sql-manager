@@ -22,3 +22,12 @@ client and support keys from the SSH agent or a selected identity file. Visual s
 operations can create, rename, and restrict-drop tables and add, rename, and
 restrict-drop columns; column types come from a fixed allowlist.
 macOS and Linux are the initial target platforms.
+
+## CI and releases
+
+The CI workflow runs formatting, Clippy, tests, and a release build on Linux and
+macOS. To prepare a release, run **Actions → Prepare Release** on `main` with a
+semantic version such as `0.2.0`, review and merge the generated release PR, then
+push the matching tag (`v0.2.0`). The tagged release workflow publishes archives
+for Apple Silicon and Intel macOS, plus x86_64 and ARM64 Linux, checksums, and a
+shell installer.
