@@ -1,4 +1,4 @@
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, aead::Aead, aead::KeyInit};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -11,6 +11,10 @@ const HEADER_LENGTH: usize = MAGIC.len() + 1;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
+const ARGON_MEMORY_KIB: u32 = 19 * 1024;
+const ARGON_ITERATIONS: u32 = 2;
+const ARGON_LANES: u32 = 1;
+const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 struct BackupPayload {
@@ -60,10 +64,7 @@ fn encrypt_payload(payload: &BackupPayload, password: &str) -> Result<Vec<u8>, S
     getrandom::fill(&mut salt).map_err(|error| error.to_string())?;
     getrandom::fill(&mut nonce).map_err(|error| error.to_string())?;
 
-    let mut key = Zeroizing::new([0_u8; KEY_LENGTH]);
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), &salt, &mut *key)
-        .map_err(|error| error.to_string())?;
+    let key = derive_key(password, &salt)?;
 
     let mut header = Vec::with_capacity(HEADER_LENGTH);
     header.extend_from_slice(MAGIC);
@@ -93,6 +94,9 @@ fn decrypt_payload(data: &[u8], password: &str) -> Result<BackupPayload, String>
     if data.len() < minimum_length {
         return Err(String::from("This file is not a valid SQL Manager backup"));
     }
+    if data.len() > MAX_BACKUP_BYTES {
+        return Err(String::from("This backup file is too large to import"));
+    }
     if &data[..MAGIC.len()] != MAGIC {
         return Err(String::from("This file is not a SQL Manager backup"));
     }
@@ -108,22 +112,21 @@ fn decrypt_payload(data: &[u8], password: &str) -> Result<BackupPayload, String>
     let nonce = &data[nonce_start..ciphertext_start];
     let ciphertext = &data[ciphertext_start..];
 
-    let mut key = Zeroizing::new([0_u8; KEY_LENGTH]);
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut *key)
-        .map_err(|error| error.to_string())?;
+    let key = derive_key(password, salt)?;
 
     let cipher = ChaCha20Poly1305::new_from_slice(&*key).map_err(|error| error.to_string())?;
     let nonce = Nonce::try_from(nonce).map_err(|_| String::from("Backup nonce is invalid"))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad: header,
-            },
-        )
-        .map_err(|_| String::from("Wrong password or damaged backup file"))?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                &nonce,
+                chacha20poly1305::aead::Payload {
+                    msg: ciphertext,
+                    aad: header,
+                },
+            )
+            .map_err(|_| String::from("Wrong password or damaged backup file"))?,
+    );
 
     let payload: BackupPayload = serde_json::from_slice(&plaintext)
         .map_err(|_| String::from("Backup contents are invalid"))?;
@@ -134,6 +137,22 @@ fn decrypt_payload(data: &[u8], password: &str) -> Result<BackupPayload, String>
     }
 
     Ok(payload)
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LENGTH]>, String> {
+    let params = Params::new(
+        ARGON_MEMORY_KIB,
+        ARGON_ITERATIONS,
+        ARGON_LANES,
+        Some(KEY_LENGTH),
+    )
+    .map_err(|error| error.to_string())?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0_u8; KEY_LENGTH]);
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut *key)
+        .map_err(|error| error.to_string())?;
+    Ok(key)
 }
 
 pub fn decrypt_profiles(

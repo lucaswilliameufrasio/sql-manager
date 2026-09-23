@@ -33,9 +33,9 @@ impl SshTunnel {
             .port();
         drop(listener);
 
-        let remote_host = format_remote_host(database_host);
+        let remote_host = format_remote_host(database_host)?;
         let forward = format!("127.0.0.1:{local_port}:{remote_host}:{database_port}");
-        let destination = format!("{}@{}", config.username, format_remote_host(&config.host));
+        let destination = format!("{}@{}", config.username, format_remote_host(&config.host)?);
         let mut command = Command::new("ssh");
         command
             .arg("-N")
@@ -108,10 +108,23 @@ fn validate_ssh_value(value: &str, label: &str) -> Result<(), String> {
     }
 }
 
-fn format_remote_host(host: &str) -> String {
+fn format_remote_host(host: &str) -> Result<String, String> {
+    let host = host.trim();
+    if host.chars().any(char::is_whitespace) {
+        return Err(String::from(
+            "SSH forwarding hosts cannot contain whitespace",
+        ));
+    }
     match host.parse::<Ipv6Addr>() {
-        Ok(address) => format!("[{address}]"),
-        Err(_) => host.to_owned(),
+        Ok(address) => Ok(format!("[{address}]")),
+        Err(_) if host.starts_with('[') && host.ends_with(']') => host[1..host.len() - 1]
+            .parse::<Ipv6Addr>()
+            .map(|address| format!("[{address}]"))
+            .map_err(|_| String::from("Invalid bracketed IPv6 host")),
+        Err(_) if host.contains(':') => Err(String::from(
+            "SSH forwarding host contains an invalid colon",
+        )),
+        Err(_) => Ok(host.to_owned()),
     }
 }
 
@@ -121,8 +134,15 @@ mod tests {
 
     #[test]
     fn brackets_ipv6_remote_hosts_for_openssh_forwarding() {
-        assert_eq!(format_remote_host("2001:db8::1"), "[2001:db8::1]");
-        assert_eq!(format_remote_host("db.example.com"), "db.example.com");
+        assert_eq!(
+            format_remote_host("2001:db8::1").expect("IPv6 host"),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            format_remote_host("db.example.com").expect("DNS host"),
+            "db.example.com"
+        );
+        assert!(format_remote_host("db.example.com:5432").is_err());
     }
 
     #[test]
