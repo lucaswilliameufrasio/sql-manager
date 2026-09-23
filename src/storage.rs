@@ -34,16 +34,21 @@ pub fn save_profile(
         updated_profiles.push(profile.clone());
     }
 
+    save_profiles(&updated_profiles)?;
+    *profiles = updated_profiles;
+    Ok(())
+}
+
+pub fn save_profiles(profiles: &[ConnectionProfile]) -> Result<(), String> {
     let path = profiles_path()?;
     let parent = path
         .parent()
         .ok_or_else(|| String::from("Could not determine the config directory"))?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
 
-    let bytes = serde_json::to_vec_pretty(&updated_profiles).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(profiles).map_err(|error| error.to_string())?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, bytes).map_err(|error| error.to_string())?;
     fs::rename(temp_path, path).map_err(|error| error.to_string())?;
-    *profiles = updated_profiles;
     Ok(())
 }

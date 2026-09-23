@@ -1,12 +1,19 @@
+mod backup;
 mod connection;
 mod secrets;
 mod storage;
 
-use std::sync::mpsc::{self, Receiver};
+use std::{
+    fs,
+    sync::mpsc::{self, Receiver},
+};
 
+use backup::{decrypt_profiles, encrypt_profiles};
 use connection::{ConnectionDraft, ConnectionProfile, TlsMode, test_connection};
 use eframe::egui;
+use rfd::FileDialog;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
@@ -24,6 +31,19 @@ struct SqlManagerApp {
     draft: ConnectionDraft,
     status: String,
     pending_test: Option<Receiver<String>>,
+    backup_dialog: Option<BackupDialog>,
+}
+
+#[derive(Clone, Copy)]
+enum BackupAction {
+    Export,
+    Import,
+}
+
+struct BackupDialog {
+    action: BackupAction,
+    password: String,
+    confirmation: String,
 }
 
 impl Default for SqlManagerApp {
@@ -42,6 +62,7 @@ impl Default for SqlManagerApp {
             draft: ConnectionDraft::default(),
             status,
             pending_test: None,
+            backup_dialog: None,
         }
     }
 }
@@ -49,8 +70,19 @@ impl Default for SqlManagerApp {
 impl eframe::App for SqlManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("header").show(ui, |ui| {
-            ui.heading("SQL Manager");
-            ui.label("PostgreSQL connections");
+            ui.horizontal(|ui| {
+                ui.heading("SQL Manager");
+                ui.separator();
+                ui.label("PostgreSQL connections");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Import backup").clicked() {
+                        self.open_backup_dialog(BackupAction::Import);
+                    }
+                    if ui.button("Export backup").clicked() {
+                        self.open_backup_dialog(BackupAction::Export);
+                    }
+                });
+            });
         });
 
         egui::Panel::left("connections")
@@ -152,10 +184,155 @@ impl eframe::App for SqlManagerApp {
             self.refresh_test_status();
             ui.label(&self.status);
         });
+
+        self.show_backup_dialog(ui.ctx());
     }
 }
 
 impl SqlManagerApp {
+    fn open_backup_dialog(&mut self, action: BackupAction) {
+        self.backup_dialog = Some(BackupDialog {
+            action,
+            password: String::new(),
+            confirmation: String::new(),
+        });
+    }
+
+    fn show_backup_dialog(&mut self, context: &egui::Context) {
+        let Some(dialog) = self.backup_dialog.as_mut() else {
+            return;
+        };
+
+        let action = dialog.action;
+        let mut close = false;
+        let mut confirm = false;
+        let title = match action {
+            BackupAction::Export => "Export encrypted backup",
+            BackupAction::Import => "Import encrypted backup",
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("The backup contains connection settings and saved passwords.");
+                ui.add_space(8.0);
+                ui.label("Backup password");
+                ui.add(egui::TextEdit::singleline(&mut dialog.password).password(true));
+
+                if matches!(action, BackupAction::Export) {
+                    ui.label("Confirm password");
+                    ui.add(egui::TextEdit::singleline(&mut dialog.confirmation).password(true));
+                    ui.label("Use at least 12 characters. This password cannot be recovered.");
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    let ready = !dialog.password.is_empty()
+                        && (matches!(action, BackupAction::Import)
+                            || (dialog.password.len() >= 12
+                                && dialog.password == dialog.confirmation));
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(match action {
+                                BackupAction::Export => "Choose file and export",
+                                BackupAction::Import => "Choose file and import",
+                            }),
+                        )
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+
+        if confirm {
+            let mut password = dialog.password.clone();
+            self.finish_backup(action, &password);
+            password.zeroize();
+            close = true;
+        }
+        if close && let Some(mut dialog) = self.backup_dialog.take() {
+            dialog.password.zeroize();
+            dialog.confirmation.zeroize();
+        }
+    }
+
+    fn finish_backup(&mut self, action: BackupAction, password: &str) {
+        match action {
+            BackupAction::Export => {
+                let Some(path) = FileDialog::new()
+                    .add_filter("SQL Manager encrypted backup", &["sqlmbackup"])
+                    .set_file_name("sql-manager.sqlmbackup")
+                    .save_file()
+                else {
+                    return;
+                };
+
+                match encrypt_profiles(&self.profiles, password)
+                    .and_then(|bytes| fs::write(path, bytes).map_err(|error| error.to_string()))
+                {
+                    Ok(()) => self.status = String::from("Encrypted backup exported"),
+                    Err(error) => self.status = format!("Could not export backup: {error}"),
+                }
+            }
+            BackupAction::Import => {
+                let Some(path) = FileDialog::new()
+                    .add_filter("SQL Manager encrypted backup", &["sqlmbackup"])
+                    .pick_file()
+                else {
+                    return;
+                };
+
+                let imported = fs::read(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| decrypt_profiles(&bytes, password));
+                let imported = match imported {
+                    Ok(imported) => imported,
+                    Err(error) => {
+                        self.status = format!("Could not import backup: {error}");
+                        return;
+                    }
+                };
+
+                let mut merged = self.profiles.clone();
+                for (profile, secret) in imported {
+                    let draft = ConnectionDraft::from(&profile);
+                    if let Err(error) = draft.to_profile(Some(profile.id)) {
+                        self.status = format!("Backup contains an invalid connection: {error}");
+                        return;
+                    }
+                    if let Some(secret) = secret
+                        && let Err(error) = secrets::save_password(profile.id, &secret)
+                    {
+                        self.status = format!("Could not restore a connection password: {error}");
+                        return;
+                    }
+
+                    if let Some(existing) = merged.iter_mut().find(|item| item.id == profile.id) {
+                        *existing = profile;
+                    } else {
+                        merged.push(profile);
+                    }
+                }
+
+                match storage::save_profiles(&merged) {
+                    Ok(()) => {
+                        self.profiles = merged;
+                        self.status = String::from("Encrypted backup imported and merged");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save restored connections: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     fn save_connection(&mut self) {
         let profile = match self.draft.to_profile(self.selected_profile_id) {
             Ok(profile) => profile,

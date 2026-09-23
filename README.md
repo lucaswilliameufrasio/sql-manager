@@ -12,7 +12,7 @@ cargo run
 ```
 
 The app currently supports saved PostgreSQL connection profiles, system-keyring
-password storage, and asynchronous connection tests over verified TLS by default.
-The remaining milestones include SSH tunneling, encrypted connection backup and
-restore, schema browsing, SQL execution, and visual data/schema management.
+password storage, asynchronous connection tests over verified TLS by default,
+and encrypted connection backup and restore. The remaining milestones include
+SSH tunneling, schema browsing, SQL execution, and visual data/schema management.
 macOS and Linux are the initial target platforms.
