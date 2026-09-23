@@ -1,6 +1,7 @@
 mod backup;
 mod connection;
 mod database;
+mod engine;
 mod schema;
 mod schema_operations;
 mod secrets;
@@ -13,9 +14,10 @@ use std::{
 };
 
 use backup::{decrypt_profiles, encrypt_profiles};
-use connection::{ConnectionDraft, ConnectionProfile, TlsMode, test_connection};
-use database::{DatabaseSession, Event as DatabaseEvent, QueryOutput};
+use connection::{ConnectionDraft, ConnectionProfile, TlsMode};
+use database::{Event as DatabaseEvent, QueryOutput};
 use eframe::egui;
+use engine::{DatabaseSession, adapter};
 use rfd::FileDialog;
 use schema::{EditedCell, TableData, delete_sql, insert_sql, update_sql};
 use schema_operations::{
@@ -42,7 +44,7 @@ struct SqlManagerApp {
     status: String,
     pending_test: Option<Receiver<String>>,
     backup_dialog: Option<BackupDialog>,
-    session: Option<DatabaseSession>,
+    session: Option<Box<dyn DatabaseSession>>,
     schemas: Vec<String>,
     tables: Vec<String>,
     selected_schema: Option<String>,
@@ -260,6 +262,10 @@ impl eframe::App for SqlManagerApp {
                     ui.text_edit_singleline(&mut self.draft.name);
                     ui.end_row();
 
+                    ui.label("Engine");
+                    ui.label(self.draft.engine.label());
+                    ui.end_row();
+
                     ui.label("Host");
                     ui.text_edit_singleline(&mut self.draft.host);
                     ui.end_row();
@@ -456,7 +462,7 @@ impl SqlManagerApp {
         self.tables.clear();
         self.selected_schema = None;
         self.query_result = None;
-        self.session = Some(DatabaseSession::connect(profile, password));
+        self.session = Some(adapter(profile.engine).connect(profile, password));
         self.status = String::from("Connecting to PostgreSQL…");
     }
 
@@ -464,7 +470,7 @@ impl SqlManagerApp {
         let events = self
             .session
             .as_ref()
-            .map(|session| session.events.try_iter().collect::<Vec<_>>())
+            .map(|session| session.drain_events())
             .unwrap_or_default();
 
         for event in events {
@@ -1247,7 +1253,9 @@ impl SqlManagerApp {
 
         std::thread::spawn(move || {
             let message = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => match runtime.block_on(test_connection(&profile, &password)) {
+                Ok(runtime) => match runtime
+                    .block_on(adapter(profile.engine).test_connection(&profile, &password))
+                {
                     Ok(server_version) => format!("Connected successfully — {server_version}"),
                     Err(error) => format!("Connection failed: {error}"),
                 },

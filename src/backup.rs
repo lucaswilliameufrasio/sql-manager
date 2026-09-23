@@ -172,7 +172,10 @@ pub fn decrypt_profiles(
 mod tests {
     use uuid::Uuid;
 
-    use crate::connection::{ConnectionProfile, SshTunnelConfig, TlsMode};
+    use crate::{
+        connection::{ConnectionProfile, SshTunnelConfig, TlsMode},
+        engine::EngineKind,
+    };
 
     use super::{
         BackupPayload, BackupProfile, VERSION, decrypt_payload, decrypt_profiles, encrypt_payload,
@@ -182,6 +185,7 @@ mod tests {
     fn test_profile() -> ConnectionProfile {
         ConnectionProfile {
             id: Uuid::new_v4(),
+            engine: EngineKind::PostgreSql,
             name: String::from("Local"),
             host: String::from("localhost"),
             port: 5432,

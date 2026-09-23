@@ -18,7 +18,7 @@ use crate::{
 
 const MAX_RESULT_ROWS: usize = 1_000;
 
-pub struct DatabaseSession {
+pub struct PostgresSession {
     commands: Sender<Command>,
     pub events: Receiver<Event>,
 }
@@ -53,7 +53,7 @@ enum Command {
     Query(String),
 }
 
-impl DatabaseSession {
+impl PostgresSession {
     pub fn connect(profile: ConnectionProfile, mut password: String) -> Self {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
@@ -168,6 +168,24 @@ impl DatabaseSession {
                 offset,
             })
             .map_err(|error| error.to_string())
+    }
+}
+
+impl crate::engine::DatabaseSession for PostgresSession {
+    fn list_tables(&self, schema: String) -> Result<(), String> {
+        PostgresSession::list_tables(self, schema)
+    }
+
+    fn execute(&self, sql: String) -> Result<(), String> {
+        PostgresSession::execute(self, sql)
+    }
+
+    fn load_table(&self, schema: String, table: String, offset: u64) -> Result<(), String> {
+        PostgresSession::load_table(self, schema, table, offset)
+    }
+
+    fn drain_events(&self) -> Vec<Event> {
+        self.events.try_iter().collect()
     }
 }
 

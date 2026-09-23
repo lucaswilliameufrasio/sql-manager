@@ -5,7 +5,7 @@ use tokio_postgres::{Client, Config, config::SslMode, tls::MakeTlsConnect};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
-use crate::ssh_tunnel::SshTunnel;
+use crate::{engine::EngineKind, ssh_tunnel::SshTunnel};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SshTunnelConfig {
@@ -18,6 +18,8 @@ pub struct SshTunnelConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConnectionProfile {
     pub id: Uuid,
+    #[serde(default)]
+    pub engine: EngineKind,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -58,6 +60,7 @@ impl TlsMode {
 }
 
 pub struct ConnectionDraft {
+    pub engine: EngineKind,
     pub name: String,
     pub host: String,
     pub port: String,
@@ -75,9 +78,10 @@ pub struct ConnectionDraft {
 impl Default for ConnectionDraft {
     fn default() -> Self {
         Self {
+            engine: EngineKind::default(),
             name: String::new(),
             host: String::new(),
-            port: String::from("5432"),
+            port: EngineKind::default().default_port().to_string(),
             database: String::new(),
             username: String::new(),
             password: String::new(),
@@ -94,6 +98,7 @@ impl Default for ConnectionDraft {
 impl ConnectionDraft {
     pub fn from(profile: &ConnectionProfile) -> Self {
         Self {
+            engine: profile.engine,
             name: profile.name.clone(),
             host: profile.host.clone(),
             port: profile.port.to_string(),
@@ -167,6 +172,7 @@ impl ConnectionDraft {
 
         Ok(ConnectionProfile {
             id: existing_id.unwrap_or_else(Uuid::new_v4),
+            engine: self.engine,
             name: name.to_owned(),
             host: host.to_owned(),
             port,
@@ -291,6 +297,27 @@ mod tests {
                 .expect("serialize profile")
                 .contains("password")
         );
+    }
+
+    #[test]
+    fn profiles_saved_before_engine_and_ssh_fields_still_load() {
+        let draft = ConnectionDraft {
+            name: String::from("Local"),
+            host: String::from("localhost"),
+            database: String::from("postgres"),
+            username: String::from("postgres"),
+            ..ConnectionDraft::default()
+        };
+        let profile = draft.to_profile(None).expect("valid profile");
+        let mut legacy = serde_json::to_value(profile).expect("serialize profile");
+        let fields = legacy.as_object_mut().expect("profile object");
+        fields.remove("engine");
+        fields.remove("ssh_tunnel");
+
+        let restored: super::ConnectionProfile =
+            serde_json::from_value(legacy).expect("load legacy profile");
+        assert_eq!(restored.engine, super::EngineKind::PostgreSql);
+        assert!(restored.ssh_tunnel.is_none());
     }
 
     #[test]

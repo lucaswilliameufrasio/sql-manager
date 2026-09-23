@@ -1,7 +1,8 @@
 # SQL Manager
 
 A lightweight native SQL client built with Rust and egui. PostgreSQL is the first
-target, with an architecture planned to support additional database engines.
+target. An engine adapter interface keeps connection testing and database sessions
+behind a driver boundary for future engines.
 
 ## Development
 
