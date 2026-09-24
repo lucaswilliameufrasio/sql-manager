@@ -192,6 +192,7 @@ impl ConnectionDraft {
         if self.name.trim().is_empty() {
             self.name = format!("{} @ {}", self.database, self.host);
         }
+        self.connection_url.clear();
         self.connection_url_applied = true;
         Ok(())
     }
@@ -414,6 +415,8 @@ mod tests {
         assert_eq!(draft.username, "alice");
         assert_eq!(draft.password, "p@ss:word");
         assert_eq!(draft.tls_mode, TlsMode::Require);
+        assert!(draft.connection_url.is_empty());
+        assert!(draft.connection_url_applied);
 
         let profile = draft.to_profile(None).expect("valid connection profile");
         assert!(
