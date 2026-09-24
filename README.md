@@ -28,10 +28,12 @@ macOS and Linux are the initial target platforms.
 The CI workflow runs formatting, Clippy, tests, and a release build on Linux and
 macOS. To prepare a release, run **Actions → Prepare Release** on `main` with a
 semantic version such as `0.2.0`, review and merge the generated release PR, then
-push the matching tag (`v0.2.0`). The release assets include a drag-and-drop
-`.dmg` containing the macOS `.app`, a zipped `.app`, and an `.AppImage` for each
-Linux architecture. Raw archives, checksums, and a shell installer are also
-published. On macOS, open the `.dmg` and drag SQL Manager to Applications. On Linux,
-mark the `.AppImage` executable once (`chmod +x SQL-Manager-linux-x86_64-v0.1.0.AppImage`)
+push the matching tag (`v0.2.0`). The Desktop Packages workflow attaches a
+drag-and-drop `.dmg` containing the macOS `.app`, a zipped `.app`, and an
+`.AppImage` for each Linux architecture. Raw archives, checksums, and a shell
+installer are also published. The v0.1.0 release currently has the `.app.zip` and
+AppImage assets; its DMG build is pending GitHub Actions billing access. On macOS,
+unzip the `.app.zip` and move SQL Manager to Applications. On Linux, mark the
+`.AppImage` executable once (`chmod +x SQL-Manager-linux-x86_64-v0.1.0.AppImage`)
 and launch it. The macOS bundle is not signed or notarized yet, so Gatekeeper may
 ask you to approve it on first open.
