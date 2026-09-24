@@ -47,7 +47,7 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux
-            arch: aarch64
+            arch: arm64
     env:
       CARGO_TERM_COLOR: always
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -91,10 +91,12 @@ jobs:
 
           BUNDLE_DIR="target/$TARGET/release/bundle/dmg"
           APP_PATH="$BUNDLE_DIR/SQL Manager.app"
-          DMG_PATH="$BUNDLE_DIR/SQL Manager.dmg"
+          DMG_SOURCE="$BUNDLE_DIR/SQL Manager.dmg"
           APP_ZIP="SQL-Manager-macos-$ARCH-$RELEASE_TAG.app.zip"
+          DMG="SQL-Manager-macos-$ARCH-$RELEASE_TAG.dmg"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_ZIP"
-          gh release upload "$RELEASE_TAG" "$APP_ZIP" "$DMG_PATH" --clobber
+          cp "$DMG_SOURCE" "$DMG"
+          gh release upload "$RELEASE_TAG" "$APP_ZIP" "$DMG" --clobber
 
       - name: Package Linux AppImage
         if: matrix.platform == 'linux'
