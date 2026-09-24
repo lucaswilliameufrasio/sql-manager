@@ -5,6 +5,20 @@ edition = "2024"
 description = "Lightweight native SQL client, starting with PostgreSQL"
 repository = "https://github.com/lucaswilliameufrasio/sql-manager"
 
+[package.metadata.bundle]
+name = "SQL Manager"
+identifier = "com.lucaswilliameufrasio.sqlmanager"
+category = "Developer Tool"
+short_description = "Lightweight native SQL client"
+long_description = "A lightweight native SQL client with PostgreSQL support, written in Rust and egui."
+appimage_metainfo_path = "packaging/com.lucaswilliameufrasio.sqlmanager.appdata.xml"
+
+[package.metadata.bundle.osx]
+minimum_system_version = "11.0"
+
+[package.metadata.bundle.linux]
+use_terminal = false
+
 [dependencies]
 argon2 = "0.6.0"
 chacha20poly1305 = { version = "0.11.0", features = ["getrandom"] }

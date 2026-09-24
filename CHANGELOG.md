@@ -2,6 +2,12 @@
 
 All notable changes to SQL Manager are documented here.
 
+## [Unreleased]
+
+### CI / Build
+
+- Package macOS app bundles and Linux AppImages
+
 ## [0.1.0] - 2026-09-23
 
 ### Bug Fixes

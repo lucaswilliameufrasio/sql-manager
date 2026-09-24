@@ -1,0 +1,116 @@
+name: Desktop Packages
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag to package (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-packages-${{ github.event.workflow_run.head_branch || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package ${{ matrix.platform }} ${{ matrix.arch }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: aarch64
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch || github.event.inputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Validate release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable version tag such as v0.1.0, received '$RELEASE_TAG'."
+            exit 1
+          fi
+
+      - name: Checkout release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref_name }}
+          persist-credentials: false
+
+      - name: Install Rust 1.98
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --version 0.12.0 --locked
+
+      - name: Build release executable
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Package macOS app and DMG
+        if: matrix.platform == 'macos'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cargo bundle --release --format dmg --target "$TARGET" \
+            --binary-path "target/$TARGET/release/sql_manager"
+
+          BUNDLE_DIR="target/$TARGET/release/bundle/dmg"
+          APP_PATH="$BUNDLE_DIR/SQL Manager.app"
+          DMG_PATH="$BUNDLE_DIR/SQL Manager.dmg"
+          APP_ZIP="SQL-Manager-macos-$ARCH-$RELEASE_TAG.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_ZIP"
+          gh release upload "$RELEASE_TAG" "$APP_ZIP" "$DMG_PATH" --clobber
+
+      - name: Package Linux AppImage
+        if: matrix.platform == 'linux'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cargo bundle --release --format appimage --target "$TARGET" \
+            --binary-path "target/$TARGET/release/sql_manager"
+
+          APPIMAGE="$(find "target/$TARGET/release/bundle/appimage" \
+            -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          if [[ -z "$APPIMAGE" ]]; then
+            echo "cargo-bundle did not produce an AppImage for $TARGET."
+            exit 1
+          fi
+          OUTPUT="SQL-Manager-linux-$ARCH-$RELEASE_TAG.AppImage"
+          cp "$APPIMAGE" "$OUTPUT"
+          chmod +x "$OUTPUT"
+          gh release upload "$RELEASE_TAG" "$OUTPUT" --clobber

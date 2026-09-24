@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.lucaswilliameufrasio.sqlmanager</id>
+  <name>SQL Manager</name>
+  <summary>Lightweight PostgreSQL desktop client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <description>
+    <p>A lightweight native SQL client built with Rust and egui.</p>
+    <p>Manage PostgreSQL connections, run SQL, browse schemas, and edit rows.</p>
+  </description>
+  <url type="homepage">https://github.com/lucaswilliameufrasio/sql-manager</url>
+  <launchable type="desktop-id">sql_manager.desktop</launchable>
+</component>

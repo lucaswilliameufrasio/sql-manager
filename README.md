@@ -28,6 +28,10 @@ macOS and Linux are the initial target platforms.
 The CI workflow runs formatting, Clippy, tests, and a release build on Linux and
 macOS. To prepare a release, run **Actions → Prepare Release** on `main` with a
 semantic version such as `0.2.0`, review and merge the generated release PR, then
-push the matching tag (`v0.2.0`). The tagged release workflow publishes archives
-for Apple Silicon and Intel macOS, plus x86_64 and ARM64 Linux, checksums, and a
-shell installer.
+push the matching tag (`v0.2.0`). The release assets include a drag-and-drop
+`.dmg` containing the macOS `.app`, a zipped `.app`, and an `.AppImage` for each
+Linux architecture. Raw archives, checksums, and a shell installer are also
+published. On macOS, open the `.dmg` and drag SQL Manager to Applications. On Linux,
+mark the `.AppImage` executable once (`chmod +x SQL-Manager-linux-x86_64-v0.1.0.AppImage`)
+and launch it. The macOS bundle is not signed or notarized yet, so Gatekeeper may
+ask you to approve it on first open.
