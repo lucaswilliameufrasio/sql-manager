@@ -35,5 +35,7 @@ installer are also published. The v0.1.0 release currently has the `.app.zip` an
 AppImage assets; its DMG build is pending GitHub Actions billing access. On macOS,
 unzip the `.app.zip` and move SQL Manager to Applications. On Linux, mark the
 `.AppImage` executable once (`chmod +x SQL-Manager-linux-x86_64-v0.1.0.AppImage`)
-and launch it. The macOS bundle is not signed or notarized yet, so Gatekeeper may
-ask you to approve it on first open.
+and launch it. The current macOS `.app.zip` is ad-hoc signed but not notarized,
+so Gatekeeper may still ask you to approve it on first open. See
+[`docs/macos-signing.md`](docs/macos-signing.md) for the workaround and the
+Developer ID/notarization setup needed to remove that warning.

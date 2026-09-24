@@ -86,16 +86,29 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
-          cargo bundle --release --format dmg --target "$TARGET" \
+          cargo bundle --release --format osx --target "$TARGET" \
             --binary-path "target/$TARGET/release/sql_manager"
 
-          BUNDLE_DIR="target/$TARGET/release/bundle/dmg"
+          BUNDLE_DIR="target/$TARGET/release/bundle/osx"
           APP_PATH="$BUNDLE_DIR/SQL Manager.app"
-          DMG_SOURCE="$BUNDLE_DIR/SQL Manager.dmg"
           APP_ZIP="SQL-Manager-macos-$ARCH-$RELEASE_TAG.app.zip"
           DMG="SQL-Manager-macos-$ARCH-$RELEASE_TAG.dmg"
+
+          # cargo-bundle currently sets LSRequiresCarbon even for this Cocoa/egui app.
+          /usr/libexec/PlistBuddy -c 'Set :LSRequiresCarbon false' \
+            "$APP_PATH/Contents/Info.plist"
+          # Ad-hoc signing keeps the bundle's code directory valid; a Developer ID
+          # certificate and notarization are documented separately.
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+
+          STAGING="$RUNNER_TEMP/sql-manager-dmg"
+          mkdir -p "$STAGING"
+          ditto "$APP_PATH" "$STAGING/SQL Manager.app"
+          ln -s /Applications "$STAGING/Applications"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_ZIP"
-          cp "$DMG_SOURCE" "$DMG"
+          hdiutil create -volname "SQL Manager" -srcfolder "$STAGING" \
+            -ov -format UDZO "$DMG"
           gh release upload "$RELEASE_TAG" "$APP_ZIP" "$DMG" --clobber
 
       - name: Package Linux AppImage
