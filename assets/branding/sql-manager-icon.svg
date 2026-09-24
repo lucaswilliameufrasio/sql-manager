@@ -1,30 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
   <title id="title">SQL Manager</title>
-  <desc id="desc">A teal database stack with an amber SQL prompt on a deep navy background.</desc>
+  <desc id="desc">A structured data grid with a bright SQL prompt, representing query and table management.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#101b2b"/>
-      <stop offset="1" stop-color="#172c3d"/>
+      <stop offset="0" stop-color="#0b1423"/>
+      <stop offset="1" stop-color="#182d42"/>
     </linearGradient>
-    <linearGradient id="database" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#35d8c0"/>
-      <stop offset="1" stop-color="#139d9b"/>
+    <linearGradient id="grid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#35dfc5"/>
+      <stop offset="1" stop-color="#21bcae"/>
     </linearGradient>
   </defs>
   <rect x="8" y="8" width="496" height="496" rx="118" fill="url(#background)"/>
-  <g fill="none" stroke="url(#database)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
-    <ellipse cx="222" cy="151" rx="116" ry="42" fill="#173748"/>
-    <path d="M106 151v193c0 24 52 43 116 43s116-19 116-43V151"/>
-    <path d="M106 215c0 24 52 43 116 43s116-19 116-43"/>
-    <path d="M106 279c0 24 52 43 116 43 22 0 43-3 61-9"/>
-  </g>
-  <g fill="#8ff5df">
-    <circle cx="145" cy="214" r="8"/>
-    <circle cx="145" cy="278" r="8"/>
-  </g>
+  <rect x="77" y="92" width="358" height="328" rx="54" fill="#12263a" stroke="url(#grid)" stroke-width="15"/>
+  <path d="M84 188h344M84 278h344M84 368h206" stroke="#35dfc5" stroke-width="13" stroke-linecap="round" opacity=".78"/>
+  <circle cx="132" cy="141" r="11" fill="#9bf4e3"/>
+  <path d="M171 141h168" stroke="#9bf4e3" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="132" cy="232" r="11" fill="#9bf4e3"/>
+  <path d="M171 232h211" stroke="#9bf4e3" stroke-width="14" stroke-linecap="round" opacity=".65"/>
   <g>
-    <rect x="279" y="270" width="178" height="142" rx="34" fill="#101b2b" stroke="#ffbd69" stroke-width="12"/>
-    <path d="m315 310 27 25-27 25" fill="none" stroke="#ffbd69" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M358 360h55" fill="none" stroke="#ffbd69" stroke-width="14" stroke-linecap="round"/>
+    <rect x="269" y="277" width="176" height="137" rx="34" fill="#0b1423" stroke="#ffbd69" stroke-width="12"/>
+    <path d="m306 312 25 24-25 24" fill="none" stroke="#ffbd69" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M350 360h54" fill="none" stroke="#ffbd69" stroke-width="15" stroke-linecap="round"/>
   </g>
 </svg>
