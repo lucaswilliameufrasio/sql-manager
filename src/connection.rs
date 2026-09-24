@@ -1,7 +1,11 @@
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{Client, Config, config::SslMode, tls::MakeTlsConnect};
+use tokio_postgres::{
+    Client, Config,
+    config::{Host, SslMode},
+    tls::MakeTlsConnect,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -61,6 +65,8 @@ impl TlsMode {
 
 pub struct ConnectionDraft {
     pub engine: EngineKind,
+    pub connection_url: String,
+    pub connection_url_applied: bool,
     pub name: String,
     pub host: String,
     pub port: String,
@@ -79,6 +85,8 @@ impl Default for ConnectionDraft {
     fn default() -> Self {
         Self {
             engine: EngineKind::default(),
+            connection_url: String::new(),
+            connection_url_applied: false,
             name: String::new(),
             host: String::new(),
             port: EngineKind::default().default_port().to_string(),
@@ -96,9 +104,103 @@ impl Default for ConnectionDraft {
 }
 
 impl ConnectionDraft {
+    pub fn apply_connection_url(&mut self) -> Result<(), String> {
+        let input = self.connection_url.trim();
+        if input.is_empty() {
+            return Err(String::from(
+                "Paste a PostgreSQL URL or connection string first",
+            ));
+        }
+
+        let config = input
+            .parse::<Config>()
+            .map_err(|error| format!("Invalid PostgreSQL connection string: {error}"))?;
+        let host = match config.get_hosts() {
+            [Host::Tcp(host)] => host.clone(),
+            [Host::Unix(path)] => path.to_string_lossy().into_owned(),
+            [] => return Err(String::from("The connection string must include a host")),
+            _ => {
+                return Err(String::from(
+                    "Multiple hosts in a connection string are not supported yet",
+                ));
+            }
+        };
+        if host.trim().is_empty() {
+            return Err(String::from("The connection string contains an empty host"));
+        }
+        let port = match config.get_ports() {
+            [] => EngineKind::PostgreSql.default_port(),
+            [port] => *port,
+            _ => {
+                return Err(String::from(
+                    "Multiple ports in a connection string are not supported yet",
+                ));
+            }
+        };
+        if port == 0 {
+            return Err(String::from(
+                "The connection string contains an invalid port",
+            ));
+        }
+
+        let username = config
+            .get_user()
+            .ok_or_else(|| String::from("The connection string must include a username"))?
+            .to_owned();
+        if username.trim().is_empty() {
+            return Err(String::from(
+                "The connection string contains an empty username",
+            ));
+        }
+        let database = config
+            .get_dbname()
+            .ok_or_else(|| String::from("The connection string must include a database name"))?
+            .to_owned();
+        if database.trim().is_empty() {
+            return Err(String::from(
+                "The connection string contains an empty database name",
+            ));
+        }
+        let password = config
+            .get_password()
+            .map(|password| {
+                String::from_utf8(password.to_vec())
+                    .map_err(|_| String::from("The connection password is not valid UTF-8"))
+            })
+            .transpose()?;
+        let tls_mode = if has_explicit_ssl_mode(input) {
+            Some(match config.get_ssl_mode() {
+                SslMode::Require => TlsMode::Require,
+                SslMode::Prefer => TlsMode::Prefer,
+                SslMode::Disable => TlsMode::Disable,
+                _ => return Err(String::from("Unsupported PostgreSQL SSL mode")),
+            })
+        } else {
+            None
+        };
+
+        self.host = host;
+        self.port = port.to_string();
+        self.username = username;
+        self.database = database;
+        if let Some(password) = password {
+            self.password = password;
+        }
+        if let Some(tls_mode) = tls_mode {
+            self.tls_mode = tls_mode;
+        }
+        if self.name.trim().is_empty() {
+            self.name = format!("{} @ {}", self.database, self.host);
+        }
+        self.connection_url_applied = true;
+        Ok(())
+    }
+
     pub fn from(profile: &ConnectionProfile) -> Self {
         Self {
             engine: profile.engine,
+            connection_url: String::new(),
+            connection_url_applied: false,
             name: profile.name.clone(),
             host: profile.host.clone(),
             port: profile.port.to_string(),
@@ -182,6 +284,22 @@ impl ConnectionDraft {
             ssh_tunnel,
         })
     }
+}
+
+fn has_explicit_ssl_mode(connection_string: &str) -> bool {
+    if let Some((_, query)) = connection_string.split_once('?') {
+        return query.split('&').any(|parameter| {
+            parameter
+                .split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
+        });
+    }
+
+    connection_string.split_whitespace().any(|parameter| {
+        parameter
+            .split_once('=')
+            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
+    })
 }
 
 pub async fn test_connection(
@@ -276,6 +394,65 @@ mod tests {
     fn draft_requires_connection_fields_and_valid_port() {
         let draft = ConnectionDraft::default();
         assert!(draft.to_profile(None).is_err());
+    }
+
+    #[test]
+    fn parses_postgres_url_into_profile_fields_and_decodes_credentials() {
+        let mut draft = ConnectionDraft {
+            connection_url: String::from(
+                "postgresql://alice:p%40ss%3Aword@db.example.com:5544/app?sslmode=require",
+            ),
+            ..ConnectionDraft::default()
+        };
+
+        draft.apply_connection_url().expect("valid PostgreSQL URL");
+
+        assert_eq!(draft.name, "app @ db.example.com");
+        assert_eq!(draft.host, "db.example.com");
+        assert_eq!(draft.port, "5544");
+        assert_eq!(draft.database, "app");
+        assert_eq!(draft.username, "alice");
+        assert_eq!(draft.password, "p@ss:word");
+        assert_eq!(draft.tls_mode, TlsMode::Require);
+
+        let profile = draft.to_profile(None).expect("valid connection profile");
+        assert!(
+            !serde_json::to_string(&profile)
+                .expect("serialize profile")
+                .contains("p@ss:word")
+        );
+    }
+
+    #[test]
+    fn preserves_secure_tls_default_unless_url_sets_sslmode() {
+        let mut draft = ConnectionDraft {
+            connection_url: String::from("postgres://alice:secret@db.example.com/app"),
+            ..ConnectionDraft::default()
+        };
+        draft
+            .apply_connection_url()
+            .expect("URL without SSL option");
+        assert_eq!(draft.tls_mode, TlsMode::Require);
+
+        draft.connection_url =
+            String::from("postgres://alice:secret@db.example.com/app?sslmode=disable");
+        draft.apply_connection_url().expect("URL with SSL option");
+        assert_eq!(draft.tls_mode, TlsMode::Disable);
+    }
+
+    #[test]
+    fn rejects_unsupported_multi_host_url_without_partially_changing_draft() {
+        let mut draft = ConnectionDraft {
+            connection_url: String::from(
+                "postgres://alice:secret@db-one.example.com,db-two.example.com/app",
+            ),
+            ..ConnectionDraft::default()
+        };
+
+        assert!(draft.apply_connection_url().is_err());
+        assert!(draft.host.is_empty());
+        assert!(draft.username.is_empty());
+        assert_eq!(draft.tls_mode, TlsMode::Require);
     }
 
     #[test]

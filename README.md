@@ -23,6 +23,11 @@ operations can create, rename, and restrict-drop tables and add, rename, and
 restrict-drop columns; column types come from a fixed allowlist.
 macOS and Linux are the initial target platforms.
 
+For PostgreSQL, paste a `postgresql://` or `postgres://` connection URL into the
+connection form and choose **Fill fields**. You can also click Connect or Test
+directly after pasting; the URL fields are parsed automatically. URL-encoded
+credentials are decoded, and saving the profile stores the password in the OS keyring.
+
 ## CI and releases
 
 The CI workflow runs formatting, Clippy, tests, and a release build on Linux and

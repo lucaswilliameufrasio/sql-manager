@@ -254,10 +254,27 @@ impl eframe::App for SqlManagerApp {
             });
             ui.add_space(8.0);
 
+            let mut parse_connection_url = false;
             egui::Grid::new("connection_form")
                 .num_columns(2)
                 .spacing([12.0, 10.0])
                 .show(ui, |ui| {
+                    ui.label("Connection URL");
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.connection_url)
+                                .hint_text("postgresql://user:password@host:5432/database")
+                                .desired_width(380.0),
+                        );
+                        if response.changed() {
+                            self.draft.connection_url_applied = false;
+                        }
+                        if ui.button("Fill fields").clicked() {
+                            parse_connection_url = true;
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label("Name");
                     ui.text_edit_singleline(&mut self.draft.name);
                     ui.end_row();
@@ -335,6 +352,13 @@ impl eframe::App for SqlManagerApp {
                         ui.end_row();
                     }
                 });
+
+            if parse_connection_url {
+                self.status = match self.draft.apply_connection_url() {
+                    Ok(()) => String::from("Connection fields filled from URL"),
+                    Err(error) => format!("Could not parse connection URL: {error}"),
+                };
+            }
 
             ui.add_space(16.0);
             ui.horizontal(|ui| {
@@ -436,7 +460,24 @@ impl eframe::App for SqlManagerApp {
 }
 
 impl SqlManagerApp {
+    fn apply_pending_connection_url(&mut self) -> bool {
+        if self.draft.connection_url.trim().is_empty() || self.draft.connection_url_applied {
+            return true;
+        }
+
+        match self.draft.apply_connection_url() {
+            Ok(()) => true,
+            Err(error) => {
+                self.status = format!("Could not parse connection URL: {error}");
+                false
+            }
+        }
+    }
+
     fn start_database_session(&mut self) {
+        if !self.apply_pending_connection_url() {
+            return;
+        }
         let profile = match self.draft.to_profile(self.selected_profile_id) {
             Ok(profile) => profile,
             Err(error) => {
@@ -1225,6 +1266,9 @@ impl SqlManagerApp {
     }
 
     fn start_connection_test(&mut self, context: &egui::Context) {
+        if !self.apply_pending_connection_url() {
+            return;
+        }
         let profile = match self.draft.to_profile(self.selected_profile_id) {
             Ok(profile) => profile,
             Err(error) => {
