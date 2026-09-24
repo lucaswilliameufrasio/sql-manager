@@ -2,16 +2,23 @@
 
 All notable changes to SQL Manager are documented here.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-24
+
+### Bug Fixes
+
+- Label architecture-specific desktop packages
+- Ad-hoc sign macOS app bundles
+- Clear connection URLs after parsing
+
+### Documentation
+
+- Clarify desktop package release status
 
 ### Features
 
-- Add SQL Manager logo and native bundle icons
-
-### CI / Build
-
-- Package macOS app bundles and Linux AppImages
-
+- Package macOS app and Linux AppImage
+- Support PostgreSQL connection URLs
+- Add SQL Manager branding assets
 ## [0.1.0] - 2026-09-23
 
 ### Bug Fixes
@@ -27,6 +34,7 @@ All notable changes to SQL Manager are documented here.
 
 - Add README
 - Bootstrap Rust egui desktop app
+- Prepare for v0.1.0
 
 ### Features
 
