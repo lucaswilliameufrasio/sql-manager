@@ -4,6 +4,10 @@ All notable changes to SQL Manager are documented here.
 
 ## [Unreleased]
 
+### Features
+
+- Add SQL Manager logo and native bundle icons
+
 ### CI / Build
 
 - Package macOS app bundles and Linux AppImages

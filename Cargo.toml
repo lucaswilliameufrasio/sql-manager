@@ -8,6 +8,7 @@ repository = "https://github.com/lucaswilliameufrasio/sql-manager"
 [package.metadata.bundle]
 name = "SQL Manager"
 identifier = "com.lucaswilliameufrasio.sqlmanager"
+icon = ["assets/branding/sql-manager-icon.svg"]
 category = "Developer Tool"
 short_description = "Lightweight native SQL client"
 long_description = "A lightweight native SQL client with PostgreSQL support, written in Rust and egui."
