@@ -51,3 +51,21 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release
+
+  postgres-e2e:
+    name: PostgreSQL end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust 1.98
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Run PostgreSQL E2E scenarios three times
+        run: ./test-e2e.sh

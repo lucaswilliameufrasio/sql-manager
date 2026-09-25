@@ -30,6 +30,7 @@ pub enum Event {
     Schemas(Vec<String>),
     Tables { schema: String, tables: Vec<String> },
     TableData(Result<TableData, String>),
+    QueryProgress(QueryOutput),
     Query(Result<QueryOutput, String>),
     Disconnected(String),
 }
@@ -48,11 +49,13 @@ impl DatabaseInfo {
     }
 }
 
+#[derive(Clone)]
 pub struct QueryOutput {
     pub result_sets: Vec<ResultSet>,
     pub summary: String,
 }
 
+#[derive(Clone)]
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
@@ -304,7 +307,7 @@ fn run_session<C>(
                     let _ = events.send(Event::TableData(result));
                 }
                 Command::Query(sql, read_only) => {
-                    let result = execute_query(&mut client, &sql, read_only).await;
+                    let result = execute_query(&mut client, &sql, read_only, &events).await;
                     let _ = events.send(Event::Query(result));
                 }
             }
@@ -494,44 +497,69 @@ async fn execute_query(
     client: &mut Client,
     sql: &str,
     read_only: bool,
+    events: &Sender<Event>,
 ) -> Result<QueryOutput, String> {
-    let mut output = QueryAccumulator::default();
     if read_only {
         validate_read_only_sql(sql)?;
-        let transaction = client
-            .build_transaction()
-            .read_only(true)
-            .start()
+        client
+            .batch_execute("BEGIN TRANSACTION READ ONLY")
             .await
-            .map_err(|error| error.to_string())?;
-        let messages = transaction
-            .simple_query(sql)
-            .await
-            .map_err(|error| error.to_string())?;
-        for message in messages {
-            output.push(message);
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|error| error.to_string())?;
-    } else {
-        let stream = client
-            .simple_query_raw(sql)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut stream = std::pin::pin!(stream);
-        while let Some(message) = stream
-            .as_mut()
-            .try_next()
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            output.push(message);
-        }
+            .map_err(|error| postgres_error_text(&error))?;
     }
 
+    let result = stream_query(client, sql, events).await;
+    if read_only {
+        let transaction_command = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        if let Err(finish_error) = client.batch_execute(transaction_command).await {
+            let finish_error = postgres_error_text(&finish_error);
+            return Err(match result {
+                Ok(_) => format!(
+                    "Query succeeded but could not commit read-only transaction: {finish_error}"
+                ),
+                Err(query_error) => format!(
+                    "{query_error}; could not roll back read-only transaction: {finish_error}"
+                ),
+            });
+        }
+    }
+    result
+}
+
+async fn stream_query(
+    client: &Client,
+    sql: &str,
+    events: &Sender<Event>,
+) -> Result<QueryOutput, String> {
+    let stream = client
+        .simple_query_raw(sql)
+        .await
+        .map_err(|error| postgres_error_text(&error))?;
+    let mut stream = std::pin::pin!(stream);
+    let mut output = QueryAccumulator::default();
+    while let Some(message) = stream
+        .as_mut()
+        .try_next()
+        .await
+        .map_err(|error| postgres_error_text(&error))?
+    {
+        if output.push(message) {
+            let _ = events.send(Event::QueryProgress(output.snapshot()));
+        }
+    }
     Ok(output.finish())
+}
+
+fn postgres_error_text(error: &tokio_postgres::Error) -> String {
+    error.as_db_error().map_or_else(
+        || error.to_string(),
+        |database_error| {
+            format!(
+                "{} (SQLSTATE {:?})",
+                database_error.message(),
+                database_error.code()
+            )
+        },
+    )
 }
 
 fn validate_read_only_sql(sql: &str) -> Result<(), String> {
@@ -598,10 +626,12 @@ fn validate_read_only_sql(sql: &str) -> Result<(), String> {
 struct QueryAccumulator {
     result_sets: Vec<ResultSet>,
     command_count: u64,
+    progress_sent: bool,
 }
 
 impl QueryAccumulator {
-    fn push(&mut self, message: SimpleQueryMessage) {
+    fn push(&mut self, message: SimpleQueryMessage) -> bool {
+        let mut reached_result_limit = false;
         match message {
             SimpleQueryMessage::RowDescription(columns) => {
                 self.result_sets.push(ResultSet {
@@ -634,22 +664,43 @@ impl QueryAccumulator {
                         );
                     } else {
                         result_set.truncated = true;
+                        reached_result_limit = true;
                     }
                 }
             }
             SimpleQueryMessage::CommandComplete(_) => self.command_count += 1,
             _ => {}
         }
+        if reached_result_limit && !self.progress_sent {
+            self.progress_sent = true;
+            return true;
+        }
+        false
     }
 
     fn finish(self) -> QueryOutput {
+        let summary = self.summary();
+        QueryOutput {
+            result_sets: self.result_sets,
+            summary,
+        }
+    }
+
+    fn snapshot(&self) -> QueryOutput {
+        QueryOutput {
+            result_sets: self.result_sets.clone(),
+            summary: self.summary(),
+        }
+    }
+
+    fn summary(&self) -> String {
         let row_count = self
             .result_sets
             .iter()
             .map(|set| set.rows.len())
             .sum::<usize>();
         let truncated = self.result_sets.iter().any(|set| set.truncated);
-        let summary = if row_count > 0 {
+        if row_count > 0 {
             let suffix = if truncated {
                 " (first 1,000 rows shown per result set)"
             } else {
@@ -658,18 +709,16 @@ impl QueryAccumulator {
             format!("{row_count} rows returned{suffix}")
         } else {
             format!("{} statement(s) completed", self.command_count)
-        };
-
-        QueryOutput {
-            result_sets: self.result_sets,
-            summary,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_read_only_sql;
+    use std::{env, time::Instant};
+
+    use super::{Event, PostgresSession, QueryOutput, validate_read_only_sql};
+    use crate::connection::{ConnectionDraft, ConnectionProfile};
 
     #[test]
     fn read_only_sql_accepts_a_single_read_statement() {
@@ -686,5 +735,161 @@ mod tests {
         assert!(validate_read_only_sql("/* bypass */ BEGIN").is_err());
         assert!(validate_read_only_sql("/* outer /* inner */ */ COMMIT").is_err());
         assert!(validate_read_only_sql("SELECT 1; COMMIT").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires SQL_MANAGER_E2E_DATABASE_URL and a local PostgreSQL server"]
+    fn postgres_session_executes_and_bounds_a_large_result_set() {
+        let mut draft = ConnectionDraft {
+            connection_url: env::var("SQL_MANAGER_E2E_DATABASE_URL")
+                .expect("set SQL_MANAGER_E2E_DATABASE_URL"),
+            ..ConnectionDraft::default()
+        };
+        draft
+            .apply_connection_url()
+            .expect("valid PostgreSQL test URL");
+        let password = draft.password.clone();
+        let profile = draft.to_profile(None).expect("valid connection profile");
+
+        let (server_sleep_output, server_sleep_elapsed) =
+            execute_e2e_query(profile.clone(), &password, "SELECT pg_sleep(0.2), 1");
+        assert!(server_sleep_elapsed >= std::time::Duration::from_millis(200));
+        assert_eq!(server_sleep_output.result_sets[0].rows.len(), 1);
+
+        let session = connect_e2e_session(profile.clone(), &password);
+        session
+            .execute(String::from(
+                "SELECT i, pg_sleep(0.001) FROM generate_series(1, 10000) i",
+            ))
+            .expect("submit streamed-result query");
+        let started = Instant::now();
+        let progress = loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(8))
+                .expect("first result batch should arrive while query is running")
+            {
+                Event::QueryProgress(output) => break output,
+                Event::Query(result) => {
+                    let _ = result.expect("query should succeed");
+                    panic!("query finished without publishing a partial result batch");
+                }
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        };
+        let first_batch_elapsed = started.elapsed();
+        assert_bounded_result(&progress);
+
+        let normal_output = loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("streamed query should finish")
+            {
+                Event::Query(result) => break result.expect("query should succeed"),
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        };
+        assert_bounded_result(&normal_output);
+
+        let (normal_output, normal_elapsed) = execute_e2e_query(
+            profile.clone(),
+            &password,
+            "SELECT generate_series(1, 1000000)",
+        );
+        assert_bounded_result(&normal_output);
+
+        let mut read_only_profile = profile.clone();
+        read_only_profile.read_only = true;
+        let (read_only_output, read_only_elapsed) = execute_e2e_query(
+            read_only_profile.clone(),
+            &password,
+            "SELECT generate_series(1, 1000000)",
+        );
+        assert_bounded_result(&read_only_output);
+
+        let table_name = format!("e2e_{}", uuid::Uuid::new_v4().simple());
+        let normal_session = connect_e2e_session(profile, &password);
+        run_e2e_session_query(
+            &normal_session,
+            &format!("CREATE TABLE {table_name} (id integer)"),
+        )
+        .expect("create read-only E2E fixture");
+
+        let read_only_session = connect_e2e_session(read_only_profile, &password);
+        let write_error = match run_e2e_session_query(
+            &read_only_session,
+            &format!("INSERT INTO {table_name} VALUES (1)"),
+        ) {
+            Ok(_) => panic!("read-only transaction unexpectedly accepted a write"),
+            Err(error) => error,
+        };
+        assert!(
+            write_error.to_lowercase().contains("read-only"),
+            "expected read-only rejection, received: {write_error}"
+        );
+        let (row_count, _) = execute_e2e_query(
+            draft.to_profile(None).expect("valid connection profile"),
+            &password,
+            &format!("SELECT count(*) FROM {table_name}"),
+        );
+        assert_eq!(row_count.result_sets[0].rows[0][0].as_deref(), Some("0"));
+        run_e2e_session_query(&normal_session, &format!("DROP TABLE {table_name}"))
+            .expect("clean up read-only E2E fixture");
+
+        eprintln!(
+            "PostgreSQL E2E timings — server sleep: {server_sleep_elapsed:?}, first 1,000 rows: {first_batch_elapsed:?}, normal 1M rows: {normal_elapsed:?}, read-only 1M rows: {read_only_elapsed:?}"
+        );
+    }
+
+    fn execute_e2e_query(
+        profile: ConnectionProfile,
+        password: &str,
+        sql: &str,
+    ) -> (QueryOutput, std::time::Duration) {
+        let session = connect_e2e_session(profile, password);
+
+        let started = Instant::now();
+        let output = run_e2e_session_query(&session, sql).expect("query should succeed");
+        (output, started.elapsed())
+    }
+
+    fn run_e2e_session_query(session: &PostgresSession, sql: &str) -> Result<QueryOutput, String> {
+        session.execute(sql.to_owned()).expect("submit E2E query");
+        loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("query should finish")
+            {
+                Event::Query(result) => break result,
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn connect_e2e_session(profile: ConnectionProfile, password: &str) -> PostgresSession {
+        let session = PostgresSession::connect(profile, password.to_owned());
+        loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("database session should connect")
+            {
+                Event::Connected => break,
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        }
+        session
+    }
+
+    fn assert_bounded_result(output: &QueryOutput) {
+        assert_eq!(output.result_sets.len(), 1);
+        assert_eq!(output.result_sets[0].rows.len(), 1_000);
+        assert!(output.result_sets[0].truncated);
     }
 }
