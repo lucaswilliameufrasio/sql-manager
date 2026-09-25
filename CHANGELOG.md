@@ -2,6 +2,16 @@
 
 All notable changes to SQL Manager are documented here.
 
+## [0.3.0] - 2026-09-25
+
+### Documentation
+
+- Define SQL Manager module boundaries
+
+### Features
+
+- Refresh SQL Manager logo
+- Add database sessions and read-only mode
 ## [0.2.0] - 2026-09-24
 
 ### Bug Fixes
@@ -9,6 +19,11 @@ All notable changes to SQL Manager are documented here.
 - Label architecture-specific desktop packages
 - Ad-hoc sign macOS app bundles
 - Clear connection URLs after parsing
+
+### Chores
+
+- Prepare for v0.2.0
+- Merge v0.2.0 preparation
 
 ### Documentation
 
