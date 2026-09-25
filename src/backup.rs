@@ -192,6 +192,8 @@ mod tests {
             database: String::from("postgres"),
             username: String::from("postgres"),
             tls_mode: TlsMode::Require,
+            show_all_databases: true,
+            read_only: false,
             ssh_tunnel: Some(SshTunnelConfig {
                 host: String::from("bastion.example.com"),
                 port: 22,

@@ -28,6 +28,7 @@ impl EngineKind {
 }
 
 pub trait DatabaseSession: Send {
+    fn list_schemas(&self) -> Result<(), String>;
     fn list_tables(&self, schema: String) -> Result<(), String>;
     fn execute(&self, sql: String) -> Result<(), String>;
     fn load_table(&self, schema: String, table: String, offset: u64) -> Result<(), String>;

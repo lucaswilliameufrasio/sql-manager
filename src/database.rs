@@ -21,15 +21,31 @@ const MAX_RESULT_ROWS: usize = 1_000;
 pub struct PostgresSession {
     commands: Sender<Command>,
     pub events: Receiver<Event>,
+    read_only: bool,
 }
 
 pub enum Event {
     Connected,
+    Databases(Result<Vec<DatabaseInfo>, String>),
     Schemas(Vec<String>),
     Tables { schema: String, tables: Vec<String> },
     TableData(Result<TableData, String>),
     Query(Result<QueryOutput, String>),
     Disconnected(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub is_template: bool,
+    pub allows_connections: bool,
+    pub has_connect_privilege: bool,
+}
+
+impl DatabaseInfo {
+    pub fn is_connectable(&self) -> bool {
+        self.allows_connections && self.has_connect_privilege
+    }
 }
 
 pub struct QueryOutput {
@@ -44,17 +60,19 @@ pub struct ResultSet {
 }
 
 enum Command {
+    ListSchemas,
     ListTables(String),
     LoadTable {
         schema: String,
         table: String,
         offset: u64,
     },
-    Query(String),
+    Query(String, bool),
 }
 
 impl PostgresSession {
     pub fn connect(profile: ConnectionProfile, mut password: String) -> Self {
+        let read_only = profile.read_only;
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
 
@@ -145,6 +163,7 @@ impl PostgresSession {
         Self {
             commands: command_sender,
             events: event_receiver,
+            read_only,
         }
     }
 
@@ -154,9 +173,15 @@ impl PostgresSession {
             .map_err(|error| error.to_string())
     }
 
+    pub fn list_schemas(&self) -> Result<(), String> {
+        self.commands
+            .send(Command::ListSchemas)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn execute(&self, sql: String) -> Result<(), String> {
         self.commands
-            .send(Command::Query(sql))
+            .send(Command::Query(sql, self.read_only))
             .map_err(|error| error.to_string())
     }
 
@@ -172,6 +197,10 @@ impl PostgresSession {
 }
 
 impl crate::engine::DatabaseSession for PostgresSession {
+    fn list_schemas(&self) -> Result<(), String> {
+        PostgresSession::list_schemas(self)
+    }
+
     fn list_tables(&self, schema: String) -> Result<(), String> {
         PostgresSession::list_tables(self, schema)
     }
@@ -208,7 +237,7 @@ fn build_config(profile: &ConnectionProfile, password: &str) -> Config {
 
 fn run_session<C>(
     runtime: Runtime,
-    client: Client,
+    mut client: Client,
     connection: C,
     commands: Receiver<Command>,
     events: Sender<Event>,
@@ -225,6 +254,15 @@ fn run_session<C>(
 
     let _ = events.send(Event::Connected);
     runtime.block_on(async move {
+        match list_databases(&client).await {
+            Ok(databases) => {
+                let _ = events.send(Event::Databases(Ok(databases)));
+            }
+            Err(error) => {
+                let _ = events.send(Event::Databases(Err(error.to_string())));
+            }
+        }
+
         match list_schemas(&client).await {
             Ok(schemas) => {
                 let _ = events.send(Event::Schemas(schemas));
@@ -237,6 +275,15 @@ fn run_session<C>(
 
         while let Ok(command) = commands.recv() {
             match command {
+                Command::ListSchemas => match list_schemas(&client).await {
+                    Ok(schemas) => {
+                        let _ = events.send(Event::Schemas(schemas));
+                    }
+                    Err(error) => {
+                        let _ = events.send(Event::Disconnected(error.to_string()));
+                        return;
+                    }
+                },
                 Command::ListTables(schema) => match list_tables(&client, &schema).await {
                     Ok(tables) => {
                         let _ = events.send(Event::Tables { schema, tables });
@@ -256,13 +303,35 @@ fn run_session<C>(
                         .map_err(|error| error.to_string());
                     let _ = events.send(Event::TableData(result));
                 }
-                Command::Query(sql) => {
-                    let result = execute_query(&client, &sql).await;
+                Command::Query(sql, read_only) => {
+                    let result = execute_query(&mut client, &sql, read_only).await;
                     let _ = events.send(Event::Query(result));
                 }
             }
         }
     });
+}
+
+async fn list_databases(client: &Client) -> Result<Vec<DatabaseInfo>, tokio_postgres::Error> {
+    let rows = client
+        .query(
+            "SELECT datname, datistemplate, datallowconn, \
+                    has_database_privilege(datname, 'CONNECT') \
+             FROM pg_catalog.pg_database \
+             ORDER BY datname",
+            &[],
+        )
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| DatabaseInfo {
+            name: row.get(0),
+            is_template: row.get(1),
+            allows_connections: row.get(2),
+            has_connect_privilege: row.get(3),
+        })
+        .collect())
 }
 
 fn handle_connection_result<C>(
@@ -421,24 +490,121 @@ async fn list_tables(client: &Client, schema: &str) -> Result<Vec<String>, tokio
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-async fn execute_query(client: &Client, sql: &str) -> Result<QueryOutput, String> {
-    let stream = client
-        .simple_query_raw(sql)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut stream = std::pin::pin!(stream);
-    let mut result_sets = Vec::<ResultSet>::new();
-    let mut command_count = 0_u64;
+async fn execute_query(
+    client: &mut Client,
+    sql: &str,
+    read_only: bool,
+) -> Result<QueryOutput, String> {
+    let mut output = QueryAccumulator::default();
+    if read_only {
+        validate_read_only_sql(sql)?;
+        let transaction = client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|error| error.to_string())?;
+        let messages = transaction
+            .simple_query(sql)
+            .await
+            .map_err(|error| error.to_string())?;
+        for message in messages {
+            output.push(message);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        let stream = client
+            .simple_query_raw(sql)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut stream = std::pin::pin!(stream);
+        while let Some(message) = stream
+            .as_mut()
+            .try_next()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            output.push(message);
+        }
+    }
 
-    while let Some(message) = stream
-        .as_mut()
-        .try_next()
-        .await
-        .map_err(|error| error.to_string())?
-    {
+    Ok(output.finish())
+}
+
+fn validate_read_only_sql(sql: &str) -> Result<(), String> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    if statement.is_empty() {
+        return Err(String::from("Enter a SQL statement"));
+    }
+    if statement.contains(';') {
+        return Err(String::from(
+            "Read-only mode accepts one SQL statement at a time",
+        ));
+    }
+
+    let mut remaining = statement;
+    loop {
+        remaining = remaining.trim_start();
+        if let Some(comment) = remaining.strip_prefix("--") {
+            remaining = comment.split_once('\n').map_or("", |(_, rest)| rest);
+            continue;
+        }
+        let Some(comment) = remaining.strip_prefix("/*") else {
+            break;
+        };
+        let bytes = comment.as_bytes();
+        let mut depth = 1_usize;
+        let mut index = 0;
+        while index + 1 < bytes.len() && depth > 0 {
+            match &bytes[index..index + 2] {
+                b"/*" => {
+                    depth += 1;
+                    index += 2;
+                }
+                b"*/" => {
+                    depth -= 1;
+                    index += 2;
+                }
+                _ => index += 1,
+            }
+        }
+        if depth > 0 {
+            return Err(String::from("Unterminated SQL comment"));
+        }
+        remaining = &comment[index..];
+    }
+
+    let keyword = remaining
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if matches!(
+        keyword.as_str(),
+        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "START" | "SAVEPOINT" | "RELEASE"
+    ) {
+        return Err(String::from(
+            "Transaction-control statements are unavailable in read-only mode",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct QueryAccumulator {
+    result_sets: Vec<ResultSet>,
+    command_count: u64,
+}
+
+impl QueryAccumulator {
+    fn push(&mut self, message: SimpleQueryMessage) {
         match message {
             SimpleQueryMessage::RowDescription(columns) => {
-                result_sets.push(ResultSet {
+                self.result_sets.push(ResultSet {
                     columns: columns
                         .iter()
                         .map(|column| column.name().to_owned())
@@ -448,8 +614,8 @@ async fn execute_query(client: &Client, sql: &str) -> Result<QueryOutput, String
                 });
             }
             SimpleQueryMessage::Row(row) => {
-                if result_sets.is_empty() {
-                    result_sets.push(ResultSet {
+                if self.result_sets.is_empty() {
+                    self.result_sets.push(ResultSet {
                         columns: row
                             .columns()
                             .iter()
@@ -459,7 +625,7 @@ async fn execute_query(client: &Client, sql: &str) -> Result<QueryOutput, String
                         truncated: false,
                     });
                 }
-                if let Some(result_set) = result_sets.last_mut() {
+                if let Some(result_set) = self.result_sets.last_mut() {
                     if result_set.rows.len() < MAX_RESULT_ROWS {
                         result_set.rows.push(
                             (0..row.len())
@@ -471,26 +637,54 @@ async fn execute_query(client: &Client, sql: &str) -> Result<QueryOutput, String
                     }
                 }
             }
-            SimpleQueryMessage::CommandComplete(_) => command_count += 1,
+            SimpleQueryMessage::CommandComplete(_) => self.command_count += 1,
             _ => {}
         }
     }
 
-    let row_count = result_sets.iter().map(|set| set.rows.len()).sum::<usize>();
-    let truncated = result_sets.iter().any(|set| set.truncated);
-    let summary = if row_count > 0 {
-        let suffix = if truncated {
-            " (first 1,000 rows shown per result set)"
+    fn finish(self) -> QueryOutput {
+        let row_count = self
+            .result_sets
+            .iter()
+            .map(|set| set.rows.len())
+            .sum::<usize>();
+        let truncated = self.result_sets.iter().any(|set| set.truncated);
+        let summary = if row_count > 0 {
+            let suffix = if truncated {
+                " (first 1,000 rows shown per result set)"
+            } else {
+                ""
+            };
+            format!("{row_count} rows returned{suffix}")
         } else {
-            ""
+            format!("{} statement(s) completed", self.command_count)
         };
-        format!("{row_count} rows returned{suffix}")
-    } else {
-        format!("{command_count} statement(s) completed")
-    };
 
-    Ok(QueryOutput {
-        result_sets,
-        summary,
-    })
+        QueryOutput {
+            result_sets: self.result_sets,
+            summary,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_read_only_sql;
+
+    #[test]
+    fn read_only_sql_accepts_a_single_read_statement() {
+        assert!(validate_read_only_sql("SELECT current_database();").is_ok());
+        assert!(
+            validate_read_only_sql("-- report query\nWITH rows AS (SELECT 1) SELECT * FROM rows")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_only_sql_rejects_transaction_control_and_multiple_statements() {
+        assert!(validate_read_only_sql("COMMIT").is_err());
+        assert!(validate_read_only_sql("/* bypass */ BEGIN").is_err());
+        assert!(validate_read_only_sql("/* outer /* inner */ */ COMMIT").is_err());
+        assert!(validate_read_only_sql("SELECT 1; COMMIT").is_err());
+    }
 }

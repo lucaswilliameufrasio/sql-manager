@@ -30,8 +30,16 @@ pub struct ConnectionProfile {
     pub database: String,
     pub username: String,
     pub tls_mode: TlsMode,
+    #[serde(default = "default_show_all_databases")]
+    pub show_all_databases: bool,
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
+}
+
+fn default_show_all_databases() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -74,6 +82,8 @@ pub struct ConnectionDraft {
     pub username: String,
     pub password: String,
     pub tls_mode: TlsMode,
+    pub show_all_databases: bool,
+    pub read_only: bool,
     pub ssh_enabled: bool,
     pub ssh_host: String,
     pub ssh_port: String,
@@ -94,6 +104,8 @@ impl Default for ConnectionDraft {
             username: String::new(),
             password: String::new(),
             tls_mode: TlsMode::default(),
+            show_all_databases: true,
+            read_only: false,
             ssh_enabled: false,
             ssh_host: String::new(),
             ssh_port: String::from("22"),
@@ -209,6 +221,8 @@ impl ConnectionDraft {
             username: profile.username.clone(),
             password: String::new(),
             tls_mode: profile.tls_mode,
+            show_all_databases: profile.show_all_databases,
+            read_only: profile.read_only,
             ssh_enabled: profile.ssh_tunnel.is_some(),
             ssh_host: profile
                 .ssh_tunnel
@@ -282,6 +296,8 @@ impl ConnectionDraft {
             database: database.to_owned(),
             username: username.to_owned(),
             tls_mode: self.tls_mode,
+            show_all_databases: self.show_all_databases,
+            read_only: self.read_only,
             ssh_tunnel,
         })
     }
@@ -493,11 +509,34 @@ mod tests {
         let fields = legacy.as_object_mut().expect("profile object");
         fields.remove("engine");
         fields.remove("ssh_tunnel");
+        fields.remove("show_all_databases");
+        fields.remove("read_only");
 
         let restored: super::ConnectionProfile =
             serde_json::from_value(legacy).expect("load legacy profile");
         assert_eq!(restored.engine, super::EngineKind::PostgreSql);
+        assert!(restored.show_all_databases);
+        assert!(!restored.read_only);
         assert!(restored.ssh_tunnel.is_none());
+    }
+
+    #[test]
+    fn read_only_mode_is_saved_in_the_connection_profile() {
+        let draft = ConnectionDraft {
+            name: String::from("Read-only reporting"),
+            host: String::from("localhost"),
+            database: String::from("analytics"),
+            username: String::from("reporter"),
+            read_only: true,
+            ..ConnectionDraft::default()
+        };
+
+        let profile = draft.to_profile(None).expect("valid profile");
+        let restored: super::ConnectionProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).expect("serialize profile"))
+                .expect("deserialize profile");
+        assert!(restored.read_only);
+        assert!(ConnectionDraft::from(&restored).read_only);
     }
 
     #[test]

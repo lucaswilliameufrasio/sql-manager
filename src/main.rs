@@ -9,13 +9,14 @@ mod ssh_tunnel;
 mod storage;
 
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     sync::mpsc::{self, Receiver},
 };
 
 use backup::{decrypt_profiles, encrypt_profiles};
 use connection::{ConnectionDraft, ConnectionProfile, TlsMode};
-use database::{Event as DatabaseEvent, QueryOutput};
+use database::{DatabaseInfo, Event as DatabaseEvent, QueryOutput};
 use eframe::egui;
 use engine::{DatabaseSession, adapter};
 use rfd::FileDialog;
@@ -25,7 +26,7 @@ use schema_operations::{
     rename_column_sql, rename_table_sql,
 };
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
@@ -38,16 +39,27 @@ fn main() -> eframe::Result {
 }
 
 struct SqlManagerApp {
+    screen: AppScreen,
+    workspace_tab: WorkspaceTab,
     profiles: Vec<ConnectionProfile>,
     selected_profile_id: Option<Uuid>,
+    connection_editor_open: bool,
     draft: ConnectionDraft,
     status: String,
     pending_test: Option<Receiver<String>>,
     backup_dialog: Option<BackupDialog>,
-    session: Option<Box<dyn DatabaseSession>>,
+    sessions: HashMap<SessionKey, Box<dyn DatabaseSession>>,
+    active_session_key: Option<SessionKey>,
+    connected_sessions: HashSet<SessionKey>,
+    connecting_sessions: HashSet<SessionKey>,
+    session_read_only: HashMap<SessionKey, bool>,
+    session_profiles: HashMap<Uuid, ConnectionProfile>,
+    session_passwords: HashMap<Uuid, Zeroizing<String>>,
+    database_catalogs: HashMap<Uuid, Vec<DatabaseInfo>>,
     schemas: Vec<String>,
     tables: Vec<String>,
     selected_schema: Option<String>,
+    selected_table: Option<String>,
     sql: String,
     query_result: Option<QueryOutput>,
     query_running: bool,
@@ -57,6 +69,26 @@ struct SqlManagerApp {
     pending_delete_row: Option<usize>,
     schema_dialog: Option<SchemaDialog>,
     selected_column: Option<String>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SessionKey {
+    profile_id: Uuid,
+    database: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AppScreen {
+    #[default]
+    Connections,
+    Workspace,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkspaceTab {
+    #[default]
+    Sql,
+    TableData,
 }
 
 #[derive(Clone, Copy)]
@@ -111,16 +143,27 @@ impl Default for SqlManagerApp {
         };
 
         Self {
+            screen: AppScreen::Connections,
+            workspace_tab: WorkspaceTab::Sql,
             profiles,
             selected_profile_id: None,
+            connection_editor_open: false,
             draft: ConnectionDraft::default(),
             status,
             pending_test: None,
             backup_dialog: None,
-            session: None,
+            sessions: HashMap::new(),
+            active_session_key: None,
+            connected_sessions: HashSet::new(),
+            connecting_sessions: HashSet::new(),
+            session_read_only: HashMap::new(),
+            session_profiles: HashMap::new(),
+            session_passwords: HashMap::new(),
+            database_catalogs: HashMap::new(),
             schemas: Vec::new(),
             tables: Vec::new(),
             selected_schema: None,
+            selected_table: None,
             sql: String::from("SELECT current_database(), current_user;"),
             query_result: None,
             query_running: false,
@@ -142,7 +185,28 @@ impl eframe::App for SqlManagerApp {
             ui.horizontal(|ui| {
                 ui.heading("SQL Manager");
                 ui.separator();
-                ui.label("PostgreSQL connections");
+                if self.screen == AppScreen::Workspace {
+                    if ui.button("Connections").clicked() {
+                        self.screen = AppScreen::Connections;
+                    }
+                    if let Some(key) = &self.active_session_key {
+                        let active_name = self
+                            .session_profiles
+                            .get(&key.profile_id)
+                            .map_or("PostgreSQL", |profile| profile.name.as_str());
+                        ui.label(format!("{active_name} · {}", key.database));
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        self.disconnect_session();
+                    }
+                } else {
+                    ui.label("Connection Manager");
+                    if self.active_session_is_connected()
+                        && ui.button("Return to Workspace").clicked()
+                    {
+                        self.screen = AppScreen::Workspace;
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Import backup").clicked() {
                         self.open_backup_dialog(BackupAction::Import);
@@ -157,43 +221,159 @@ impl eframe::App for SqlManagerApp {
         egui::Panel::left("connections")
             .resizable(true)
             .default_size(220.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Connections");
-                    if ui.button("+").on_hover_text("New connection").clicked() {
-                        self.selected_profile_id = None;
-                        self.draft = ConnectionDraft::default();
-                        self.status = String::from("New connection");
-                    }
-                });
-                ui.separator();
-
-                let mut selected = self.selected_profile_id;
-                for profile in &self.profiles {
-                    let response =
-                        ui.selectable_value(&mut selected, Some(profile.id), &profile.name);
-                    if response.clicked() {
-                        self.draft = ConnectionDraft::from(profile);
-                        self.draft.password = match secrets::load_password(profile.id) {
-                            Ok(Some(password)) => password,
-                            Ok(None) => String::new(),
-                            Err(error) => {
-                                self.status = format!("Could not load saved password: {error}");
-                                String::new()
-                            }
-                        };
-                    }
-                }
-                self.selected_profile_id = selected;
-
-                if self.session.is_some() {
-                    ui.separator();
+            .show(ui, |ui| match self.screen {
+                AppScreen::Connections => {
+                    let mut selected = self.selected_profile_id;
+                    let mut create_profile = false;
                     ui.horizontal(|ui| {
-                        ui.heading("Schemas");
-                        if self.selected_schema.is_some() && ui.small_button("+ Table").clicked() {
-                            self.open_schema_dialog(SchemaAction::CreateTable);
+                        ui.heading("Saved connections");
+                        if ui.small_button("New").clicked() {
+                            create_profile = true;
                         }
                     });
+                    ui.separator();
+
+                    for profile in &self.profiles {
+                        let response =
+                            ui.selectable_label(selected == Some(profile.id), &profile.name);
+                        if response.clicked() {
+                            selected = Some(profile.id);
+                            self.draft = ConnectionDraft::from(profile);
+                            self.draft.password = match secrets::load_password(profile.id) {
+                                Ok(Some(password)) => password,
+                                Ok(None) => String::new(),
+                                Err(error) => {
+                                    self.status = format!("Could not load saved password: {error}");
+                                    String::new()
+                                }
+                            };
+                            self.connection_editor_open = false;
+                        }
+                    }
+                    self.selected_profile_id = selected;
+
+                    if create_profile {
+                        self.selected_profile_id = None;
+                        self.draft = ConnectionDraft::default();
+                        self.connection_editor_open = true;
+                        self.status = String::from("New connection");
+                    }
+
+                    ui.separator();
+                    ui.heading("Open sessions");
+                    let mut open_sessions = self
+                        .sessions
+                        .keys()
+                        .map(|key| {
+                            let name = self
+                                .session_profiles
+                                .get(&key.profile_id)
+                                .map_or("PostgreSQL", |profile| profile.name.as_str());
+                            (key.clone(), format!("{name} · {}", key.database))
+                        })
+                        .collect::<Vec<_>>();
+                    open_sessions.sort_by(|left, right| left.1.cmp(&right.1));
+                    let mut activate = None;
+                    for (key, label) in open_sessions {
+                        let connected = self.connected_sessions.contains(&key);
+                        let label = if connected {
+                            label
+                        } else {
+                            format!("{label} · Connecting…")
+                        };
+                        if ui
+                            .selectable_label(self.active_session_key.as_ref() == Some(&key), label)
+                            .clicked()
+                        {
+                            activate = Some(key);
+                        }
+                    }
+                    if let Some(key) = activate {
+                        self.activate_session(key);
+                    }
+                }
+                AppScreen::Workspace => {
+                    let Some(active_key) = self.active_session_key.clone() else {
+                        ui.label("No active database session");
+                        return;
+                    };
+
+                    ui.heading("Open database sessions");
+                    let mut open_sessions = self
+                        .sessions
+                        .keys()
+                        .map(|key| {
+                            let profile_name = self
+                                .session_profiles
+                                .get(&key.profile_id)
+                                .map_or("PostgreSQL", |profile| profile.name.as_str());
+                            (key.clone(), format!("{profile_name} · {}", key.database))
+                        })
+                        .collect::<Vec<_>>();
+                    open_sessions.sort_by(|left, right| left.1.cmp(&right.1));
+                    let mut requested_session = None;
+                    for (key, label) in open_sessions {
+                        if ui
+                            .selectable_label(self.active_session_key.as_ref() == Some(&key), label)
+                            .clicked()
+                        {
+                            requested_session = Some(key);
+                        }
+                    }
+                    if let Some(key) = requested_session {
+                        self.activate_session(key);
+                    }
+
+                    ui.heading("Database Browser");
+                    ui.label(&active_key.database);
+                    ui.separator();
+
+                    let show_all = self
+                        .session_profiles
+                        .get(&active_key.profile_id)
+                        .is_none_or(|profile| profile.show_all_databases);
+                    let mut show_all_next = show_all;
+                    if ui
+                        .checkbox(&mut show_all_next, "Show all databases")
+                        .changed()
+                    {
+                        self.update_show_all_databases(active_key.profile_id, show_all_next);
+                    }
+
+                    let databases = self
+                        .database_catalogs
+                        .get(&active_key.profile_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut requested_database = None;
+                    for database in databases {
+                        if !show_all && database.name != active_key.database {
+                            continue;
+                        }
+                        let label = if database.is_connectable() {
+                            database.name.clone()
+                        } else if database.is_template {
+                            format!("{} (template database)", database.name)
+                        } else if !database.allows_connections {
+                            format!("{} (connections disabled)", database.name)
+                        } else {
+                            format!("{} (no CONNECT privilege)", database.name)
+                        };
+                        let mut clicked = false;
+                        ui.add_enabled_ui(database.is_connectable(), |ui| {
+                            clicked = ui
+                                .selectable_label(database.name == active_key.database, label)
+                                .clicked();
+                        });
+                        if clicked {
+                            requested_database = Some(database.name);
+                        }
+                    }
+                    if let Some(database) = requested_database {
+                        self.open_database_for_profile(active_key.profile_id, database);
+                    }
+                    ui.separator();
+
                     let mut requested_schema = None;
                     for schema in &self.schemas {
                         if ui
@@ -206,24 +386,33 @@ impl eframe::App for SqlManagerApp {
                     if let Some(schema) = requested_schema {
                         self.selected_schema = Some(schema.clone());
                         self.tables.clear();
+                        self.selected_table = None;
                         self.current_table = None;
                         self.selected_column = None;
-                        if let Some(session) = &self.session {
+                        if let Some(session) = self.active_session() {
                             let _ = session.list_tables(schema);
                         }
+                    }
+
+                    if self.selected_schema.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("Tables");
+                            if ui
+                                .add_enabled(
+                                    !self.active_session_is_read_only(),
+                                    egui::Button::new("+ Table"),
+                                )
+                                .clicked()
+                            {
+                                self.open_schema_dialog(SchemaAction::CreateTable);
+                            }
+                        });
                     }
 
                     let mut requested_table = None;
                     for table in &self.tables {
                         if ui
-                            .selectable_label(
-                                self.current_table.as_ref().is_some_and(|current| {
-                                    current.name == *table
-                                        && Some(current.schema.as_str())
-                                            == self.selected_schema.as_deref()
-                                }),
-                                table,
-                            )
+                            .selectable_label(self.selected_table.as_ref() == Some(table), table)
                             .clicked()
                         {
                             requested_table = Some(table.clone());
@@ -233,220 +422,41 @@ impl eframe::App for SqlManagerApp {
                         && let Some(schema) = self.selected_schema.clone()
                     {
                         self.selected_column = None;
+                        self.current_table = None;
+                        self.selected_table = Some(table.clone());
                         self.sql = format!(
                             "SELECT * FROM {}.{} LIMIT 100;",
                             schema::quote_identifier(&schema),
                             schema::quote_identifier(&table)
                         );
-                        self.table_loading = true;
-                        if let Some(session) = &self.session {
-                            let _ = session.load_table(schema, table, 0);
+                    }
+
+                    if let Some(table) = &self.selected_table {
+                        ui.separator();
+                        ui.label(table);
+                        if ui.button("View Data").clicked()
+                            && let (Some(session), Some(schema)) =
+                                (self.active_session(), self.selected_schema.clone())
+                        {
+                            match session.load_table(schema, table.clone(), 0) {
+                                Ok(()) => {
+                                    self.table_loading = true;
+                                    self.workspace_tab = WorkspaceTab::TableData;
+                                }
+                                Err(error) => {
+                                    self.status = format!("Could not open table data: {error}");
+                                }
+                            }
                         }
                     }
                 }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(if self.selected_profile_id.is_some() {
-                "Edit connection"
-            } else {
-                "New connection"
-            });
-            ui.add_space(8.0);
-
-            let mut parse_connection_url = false;
-            egui::Grid::new("connection_form")
-                .num_columns(2)
-                .spacing([12.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Connection URL");
-                    ui.horizontal(|ui| {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.draft.connection_url)
-                                .hint_text("postgresql://user:password@host:5432/database")
-                                .desired_width(380.0),
-                        );
-                        if response.changed() {
-                            self.draft.connection_url_applied = false;
-                        }
-                        if ui.button("Fill fields").clicked() {
-                            parse_connection_url = true;
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut self.draft.name);
-                    ui.end_row();
-
-                    ui.label("Engine");
-                    ui.label(self.draft.engine.label());
-                    ui.end_row();
-
-                    ui.label("Host");
-                    ui.text_edit_singleline(&mut self.draft.host);
-                    ui.end_row();
-
-                    ui.label("Port");
-                    ui.add(egui::TextEdit::singleline(&mut self.draft.port).desired_width(90.0));
-                    ui.end_row();
-
-                    ui.label("Database");
-                    ui.text_edit_singleline(&mut self.draft.database);
-                    ui.end_row();
-
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut self.draft.username);
-                    ui.end_row();
-
-                    ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut self.draft.password).password(true));
-                    ui.end_row();
-
-                    ui.label("SSL mode");
-                    egui::ComboBox::from_id_salt("ssl_mode")
-                        .selected_text(self.draft.tls_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in TlsMode::ALL {
-                                ui.selectable_value(&mut self.draft.tls_mode, mode, mode.label());
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label("SSH tunnel");
-                    ui.checkbox(&mut self.draft.ssh_enabled, "Use OpenSSH tunnel");
-                    ui.end_row();
-
-                    if self.draft.ssh_enabled {
-                        ui.label("SSH host");
-                        ui.text_edit_singleline(&mut self.draft.ssh_host);
-                        ui.end_row();
-
-                        ui.label("SSH port");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.draft.ssh_port)
-                                .desired_width(90.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("SSH username");
-                        ui.text_edit_singleline(&mut self.draft.ssh_username);
-                        ui.end_row();
-
-                        ui.label("SSH identity");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft.ssh_identity_file)
-                                    .desired_width(220.0),
-                            );
-                            if ui.button("Browse").clicked()
-                                && let Some(path) = FileDialog::new().pick_file()
-                            {
-                                self.draft.ssh_identity_file = path.display().to_string();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("");
-                        ui.label("Uses ssh-agent or this key file; trust the SSH host key first.");
-                        ui.end_row();
-                    }
-                });
-
-            if parse_connection_url {
-                self.status = match self.draft.apply_connection_url() {
-                    Ok(()) => String::from("Connection fields filled from URL"),
-                    Err(error) => format!("Could not parse connection URL: {error}"),
-                };
+            match self.screen {
+                AppScreen::Connections => self.show_connection_manager(ui),
+                AppScreen::Workspace => self.show_workspace(ui),
             }
-
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save connection").clicked() {
-                    self.save_connection();
-                }
-
-                let testing = self.pending_test.is_some();
-                if ui
-                    .add_enabled(!testing, egui::Button::new("Test connection"))
-                    .clicked()
-                {
-                    self.start_connection_test(ui.ctx());
-                }
-
-                if self.session.is_none() {
-                    if ui.button("Connect").clicked() {
-                        self.start_database_session();
-                    }
-                } else if ui.button("Disconnect").clicked() {
-                    self.session = None;
-                    self.schemas.clear();
-                    self.tables.clear();
-                    self.selected_schema = None;
-                    self.query_result = None;
-                    self.status = String::from("Disconnected");
-                }
-            });
-
-            if self.session.is_some() {
-                ui.separator();
-                ui.heading("SQL workspace");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.sql)
-                        .code_editor()
-                        .desired_rows(10)
-                        .desired_width(f32::INFINITY),
-                );
-                if ui
-                    .add_enabled(
-                        !self.query_running && !self.sql.trim().is_empty(),
-                        egui::Button::new(if self.query_running {
-                            "Running…"
-                        } else {
-                            "Run query"
-                        }),
-                    )
-                    .clicked()
-                    && let Some(session) = &self.session
-                {
-                    match session.execute(self.sql.clone()) {
-                        Ok(()) => {
-                            self.query_running = true;
-                            self.status = String::from("Running query…");
-                        }
-                        Err(error) => self.status = format!("Could not submit query: {error}"),
-                    }
-                }
-
-                if let Some(result) = &self.query_result {
-                    ui.label(&result.summary);
-                    egui::ScrollArea::both().max_height(260.0).show(ui, |ui| {
-                        for (result_index, result_set) in result.result_sets.iter().enumerate() {
-                            ui.label(format!("Result {}", result_index + 1));
-                            egui::Grid::new(("query_result", result_index))
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for column in &result_set.columns {
-                                        ui.strong(column);
-                                    }
-                                    ui.end_row();
-                                    for row in &result_set.rows {
-                                        for value in row {
-                                            ui.label(value.as_deref().unwrap_or("NULL"));
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                            if result_set.truncated {
-                                ui.label("Result limited to the first 1,000 rows.");
-                            }
-                        }
-                    });
-                }
-
-                self.show_table_data(ui);
-            }
-
             ui.add_space(12.0);
             self.refresh_test_status();
             ui.label(&self.status);
@@ -460,6 +470,576 @@ impl eframe::App for SqlManagerApp {
 }
 
 impl SqlManagerApp {
+    fn active_session(&self) -> Option<&dyn DatabaseSession> {
+        self.active_session_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key).map(Box::as_ref))
+    }
+
+    fn active_session_is_connected(&self) -> bool {
+        self.active_session_key
+            .as_ref()
+            .is_some_and(|key| self.connected_sessions.contains(key))
+    }
+
+    fn active_session_is_read_only(&self) -> bool {
+        self.active_session_key
+            .as_ref()
+            .and_then(|key| self.session_read_only.get(key))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn reset_workspace_view(&mut self) {
+        self.workspace_tab = WorkspaceTab::Sql;
+        self.schemas.clear();
+        self.tables.clear();
+        self.selected_schema = None;
+        self.selected_table = None;
+        self.sql = String::from("SELECT current_database(), current_user;");
+        self.query_result = None;
+        self.query_running = false;
+        self.current_table = None;
+        self.table_loading = false;
+        self.row_editor = None;
+        self.pending_delete_row = None;
+        self.schema_dialog = None;
+        self.selected_column = None;
+    }
+
+    fn activate_session(&mut self, key: SessionKey) {
+        self.active_session_key = Some(key.clone());
+        self.selected_profile_id = Some(key.profile_id);
+        self.reset_workspace_view();
+
+        if self.connected_sessions.contains(&key) {
+            self.screen = AppScreen::Workspace;
+            if let Some(session) = self.sessions.get(&key) {
+                let _ = session.list_schemas();
+            }
+            self.status = format!("Connected to {}", key.database);
+        } else {
+            self.screen = AppScreen::Connections;
+            self.status = format!("Connecting to {}…", key.database);
+        }
+    }
+
+    fn open_database_session(
+        &mut self,
+        profile: ConnectionProfile,
+        database: String,
+        password: String,
+    ) {
+        let profile_id = profile.id;
+        let key = SessionKey {
+            profile_id,
+            database: database.clone(),
+        };
+
+        if self.sessions.contains_key(&key) {
+            if self.session_read_only.get(&key) == Some(&profile.read_only) {
+                self.activate_session(key);
+                return;
+            }
+            self.close_session(&key);
+        }
+
+        self.session_profiles.insert(profile_id, profile.clone());
+        self.session_read_only
+            .insert(key.clone(), profile.read_only);
+
+        let mut password = Zeroizing::new(password);
+        let cached_password = self
+            .session_passwords
+            .entry(profile_id)
+            .or_insert_with(|| Zeroizing::new(password.to_string()))
+            .to_string();
+        password.zeroize();
+
+        let mut target = profile;
+        target.database = database.clone();
+        let engine = target.engine;
+        self.sessions.insert(
+            key.clone(),
+            adapter(engine).connect(target, cached_password),
+        );
+        self.connecting_sessions.insert(key.clone());
+        self.active_session_key = Some(key.clone());
+        self.selected_profile_id = Some(profile_id);
+        self.reset_workspace_view();
+        self.status = format!("Connecting to {database}…");
+    }
+
+    fn open_database_for_profile(&mut self, profile_id: Uuid, database: String) {
+        let profile = self.session_profiles.get(&profile_id).cloned().or_else(|| {
+            self.profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .cloned()
+        });
+        let Some(profile) = profile else {
+            self.status = String::from("Connection profile is no longer available");
+            return;
+        };
+
+        let password = match self.session_passwords.get(&profile_id) {
+            Some(password) => password.to_string(),
+            None => match secrets::load_password(profile_id) {
+                Ok(Some(password)) => password,
+                Ok(None) => String::new(),
+                Err(error) => {
+                    self.status =
+                        format!("Could not load password from the system keyring: {error}");
+                    return;
+                }
+            },
+        };
+        self.open_database_session(profile, database, password);
+    }
+
+    fn update_show_all_databases(&mut self, profile_id: Uuid, show_all: bool) {
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == profile_id)
+        else {
+            self.status = String::from("Save this profile before changing its database browser");
+            return;
+        };
+
+        let mut profile = self.profiles[index].clone();
+        profile.show_all_databases = show_all;
+        match storage::save_profile(&profile, &mut self.profiles) {
+            Ok(()) => {
+                if let Some(session_profile) = self.session_profiles.get_mut(&profile_id) {
+                    session_profile.show_all_databases = show_all;
+                }
+                self.status = if show_all {
+                    String::from("Showing all server databases")
+                } else {
+                    String::from("Showing the selected database only")
+                };
+            }
+            Err(error) => self.status = format!("Could not save database browser setting: {error}"),
+        }
+    }
+
+    fn close_session(&mut self, key: &SessionKey) {
+        self.sessions.remove(key);
+        self.connected_sessions.remove(key);
+        self.connecting_sessions.remove(key);
+        self.session_read_only.remove(key);
+        if self.active_session_key.as_ref() == Some(key) {
+            self.active_session_key = None;
+            self.screen = AppScreen::Connections;
+            self.selected_profile_id = self
+                .profiles
+                .iter()
+                .any(|profile| profile.id == key.profile_id)
+                .then_some(key.profile_id);
+            self.reset_workspace_view();
+            self.status = format!("Disconnected from {}", key.database);
+        }
+
+        let profile_still_open = self
+            .sessions
+            .keys()
+            .any(|open_key| open_key.profile_id == key.profile_id);
+        if !profile_still_open {
+            self.session_profiles.remove(&key.profile_id);
+            self.session_passwords.remove(&key.profile_id);
+            self.database_catalogs.remove(&key.profile_id);
+        }
+    }
+
+    fn disconnect_session(&mut self) {
+        if let Some(key) = self.active_session_key.clone() {
+            self.close_session(&key);
+        } else {
+            self.screen = AppScreen::Connections;
+            self.reset_workspace_view();
+            self.status = String::from("No active database session");
+        }
+    }
+
+    fn show_connection_manager(&mut self, ui: &mut egui::Ui) {
+        if self.connection_editor_open {
+            self.show_connection_editor(ui);
+            return;
+        }
+
+        ui.heading("Connection Manager");
+        ui.label("Create a PostgreSQL profile or select one from the Connections list.");
+        ui.add_space(12.0);
+
+        let profile = self
+            .selected_profile_id
+            .and_then(|id| self.profiles.iter().find(|profile| profile.id == id))
+            .cloned();
+        let Some(profile) = profile else {
+            ui.label("Select a saved connection, or create a new one.");
+            if ui.button("New connection").clicked() {
+                self.selected_profile_id = None;
+                self.draft = ConnectionDraft::default();
+                self.connection_editor_open = true;
+            }
+            return;
+        };
+
+        ui.group(|ui| {
+            ui.heading(&profile.name);
+            egui::Grid::new("profile_summary")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Engine");
+                    ui.label(profile.engine.label());
+                    ui.end_row();
+                    ui.label("Host");
+                    ui.label(format!("{}:{}", profile.host, profile.port));
+                    ui.end_row();
+                    ui.label("Database");
+                    ui.label(&profile.database);
+                    ui.end_row();
+                    ui.label("Username");
+                    ui.label(&profile.username);
+                    ui.end_row();
+                    ui.label("TLS");
+                    ui.label(profile.tls_mode.label());
+                    ui.end_row();
+                    ui.label("Show all databases");
+                    ui.label(if profile.show_all_databases {
+                        "Yes"
+                    } else {
+                        "No"
+                    });
+                    ui.end_row();
+                    ui.label("Read Only");
+                    ui.label(if profile.read_only {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    });
+                    ui.end_row();
+                    if let Some(ssh) = &profile.ssh_tunnel {
+                        ui.label("SSH tunnel");
+                        ui.label(format!("{}@{}:{}", ssh.username, ssh.host, ssh.port));
+                        ui.end_row();
+                    }
+                });
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("Edit connection").clicked() {
+                self.draft = ConnectionDraft::from(&profile);
+                self.draft.password = match secrets::load_password(profile.id) {
+                    Ok(Some(password)) => password,
+                    Ok(None) => String::new(),
+                    Err(error) => {
+                        self.status = format!("Could not load saved password: {error}");
+                        String::new()
+                    }
+                };
+                self.connection_editor_open = true;
+            }
+
+            if ui
+                .add_enabled(
+                    self.pending_test.is_none(),
+                    egui::Button::new("Test connection"),
+                )
+                .clicked()
+            {
+                self.start_connection_test(ui.ctx());
+            }
+
+            let default_session = SessionKey {
+                profile_id: profile.id,
+                database: profile.database.clone(),
+            };
+            if self.connected_sessions.contains(&default_session) {
+                if ui.button("Open Workspace").clicked() {
+                    self.activate_session(default_session.clone());
+                }
+                if self.active_session_key.as_ref() == Some(&default_session)
+                    && ui.button("Close Session").clicked()
+                {
+                    self.close_session(&default_session);
+                }
+            } else if self.connecting_sessions.contains(&default_session) {
+                ui.label(format!("Connecting to {}…", profile.database));
+                if ui.button("Cancel").clicked() {
+                    self.close_session(&default_session);
+                }
+            } else {
+                if ui.button("Connect").clicked() {
+                    self.open_database_for_profile(profile.id, profile.database.clone());
+                }
+            }
+        });
+    }
+
+    fn show_connection_editor(&mut self, ui: &mut egui::Ui) {
+        ui.heading(if self.selected_profile_id.is_some() {
+            "Edit connection"
+        } else {
+            "New connection"
+        });
+        ui.add_space(8.0);
+
+        let mut parse_connection_url = false;
+        egui::Grid::new("connection_form")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Connection URL");
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.connection_url)
+                            .hint_text("postgresql://user:password@host:5432/database")
+                            .desired_width(380.0),
+                    );
+                    if response.changed() {
+                        self.draft.connection_url_applied = false;
+                    }
+                    if ui.button("Fill fields").clicked() {
+                        parse_connection_url = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.draft.name);
+                ui.end_row();
+
+                ui.label("Engine");
+                ui.label(self.draft.engine.label());
+                ui.end_row();
+
+                ui.label("Host");
+                ui.text_edit_singleline(&mut self.draft.host);
+                ui.end_row();
+
+                ui.label("Port");
+                ui.add(egui::TextEdit::singleline(&mut self.draft.port).desired_width(90.0));
+                ui.end_row();
+
+                ui.label("Database");
+                ui.text_edit_singleline(&mut self.draft.database);
+                ui.end_row();
+
+                ui.label("Username");
+                ui.text_edit_singleline(&mut self.draft.username);
+                ui.end_row();
+
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut self.draft.password).password(true));
+                ui.end_row();
+
+                ui.label("SSL mode");
+                egui::ComboBox::from_id_salt("ssl_mode")
+                    .selected_text(self.draft.tls_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in TlsMode::ALL {
+                            ui.selectable_value(&mut self.draft.tls_mode, mode, mode.label());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Database browser");
+                ui.checkbox(
+                    &mut self.draft.show_all_databases,
+                    "Show all server databases",
+                );
+                ui.end_row();
+
+                ui.label("Execution mode");
+                ui.checkbox(&mut self.draft.read_only, "Read-only SQL session");
+                ui.end_row();
+
+                ui.label("SSH tunnel");
+                ui.checkbox(&mut self.draft.ssh_enabled, "Use OpenSSH tunnel");
+                ui.end_row();
+
+                if self.draft.ssh_enabled {
+                    ui.label("SSH host");
+                    ui.text_edit_singleline(&mut self.draft.ssh_host);
+                    ui.end_row();
+
+                    ui.label("SSH port");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.ssh_port).desired_width(90.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("SSH username");
+                    ui.text_edit_singleline(&mut self.draft.ssh_username);
+                    ui.end_row();
+
+                    ui.label("SSH identity");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.ssh_identity_file)
+                                .desired_width(220.0),
+                        );
+                        if ui.button("Browse").clicked()
+                            && let Some(path) = FileDialog::new().pick_file()
+                        {
+                            self.draft.ssh_identity_file = path.display().to_string();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("");
+                    ui.label("Uses ssh-agent or this key file; trust the SSH host key first.");
+                    ui.end_row();
+                }
+            });
+
+        if parse_connection_url {
+            self.status = match self.draft.apply_connection_url() {
+                Ok(()) => String::from("Connection fields filled from URL"),
+                Err(error) => format!("Could not parse connection URL: {error}"),
+            };
+        }
+
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save connection").clicked() {
+                self.save_connection();
+            }
+            if ui
+                .add_enabled(
+                    self.pending_test.is_none(),
+                    egui::Button::new("Test connection"),
+                )
+                .clicked()
+            {
+                self.start_connection_test(ui.ctx());
+            }
+            if ui.button("Save & Connect").clicked() && self.save_connection() {
+                self.start_database_session();
+            }
+            if let Some(key) = self.active_session_key.clone()
+                && self.connecting_sessions.contains(&key)
+                && ui.button("Cancel connection").clicked()
+            {
+                self.close_session(&key);
+            }
+            if ui.button("Cancel").clicked() {
+                self.connection_editor_open = false;
+                if let Some(id) = self.selected_profile_id
+                    && let Some(profile) = self.profiles.iter().find(|profile| profile.id == id)
+                {
+                    self.draft = ConnectionDraft::from(profile);
+                    self.draft.password = secrets::load_password(id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                } else {
+                    self.draft = ConnectionDraft::default();
+                }
+            }
+        });
+    }
+
+    fn show_workspace(&mut self, ui: &mut egui::Ui) {
+        let Some(active_key) = self.active_session_key.as_ref() else {
+            ui.heading("Workspace");
+            ui.label("Connect to a database to open the workspace.");
+            if ui.button("Open Connection Manager").clicked() {
+                self.screen = AppScreen::Connections;
+            }
+            return;
+        };
+        if !self.connected_sessions.contains(active_key) {
+            ui.heading("Opening database session…");
+            ui.label(&self.status);
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.workspace_tab, WorkspaceTab::Sql, "SQL Editor");
+            ui.add_enabled_ui(self.current_table.is_some() || self.table_loading, |ui| {
+                ui.selectable_value(
+                    &mut self.workspace_tab,
+                    WorkspaceTab::TableData,
+                    "Table Data",
+                );
+            });
+        });
+        ui.separator();
+
+        match self.workspace_tab {
+            WorkspaceTab::Sql => self.show_sql_editor(ui),
+            WorkspaceTab::TableData => self.show_table_data(ui),
+        }
+    }
+
+    fn show_sql_editor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("SQL Editor");
+        if self.active_session_is_read_only() {
+            ui.label("Read-only mode: SQL runs in a PostgreSQL read-only transaction.");
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut self.sql)
+                .code_editor()
+                .desired_rows(12)
+                .desired_width(f32::INFINITY),
+        );
+        if ui
+            .add_enabled(
+                !self.query_running && !self.sql.trim().is_empty(),
+                egui::Button::new(if self.query_running {
+                    "Running…"
+                } else if self.active_session_is_read_only() {
+                    "Run read-only query"
+                } else {
+                    "Run query"
+                }),
+            )
+            .clicked()
+            && let Some(session) = self.active_session()
+        {
+            match session.execute(self.sql.clone()) {
+                Ok(()) => {
+                    self.query_running = true;
+                    self.status = String::from("Running query…");
+                }
+                Err(error) => self.status = format!("Could not submit query: {error}"),
+            }
+        }
+
+        if let Some(result) = &self.query_result {
+            ui.add_space(8.0);
+            ui.heading("Results");
+            ui.label(&result.summary);
+            egui::ScrollArea::both().max_height(360.0).show(ui, |ui| {
+                for (result_index, result_set) in result.result_sets.iter().enumerate() {
+                    ui.label(format!("Result {}", result_index + 1));
+                    egui::Grid::new(("query_result", result_index))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for column in &result_set.columns {
+                                ui.strong(column);
+                            }
+                            ui.end_row();
+                            for row in &result_set.rows {
+                                for value in row {
+                                    ui.label(value.as_deref().unwrap_or("NULL"));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    if result_set.truncated {
+                        ui.label("Result limited to the first 1,000 rows.");
+                    }
+                }
+            });
+        }
+    }
+
     fn apply_pending_connection_url(&mut self) -> bool {
         if self.draft.connection_url.trim().is_empty() || self.draft.connection_url_applied {
             return true;
@@ -499,58 +1079,89 @@ impl SqlManagerApp {
             self.draft.password.clone()
         };
 
-        self.schemas.clear();
-        self.tables.clear();
-        self.selected_schema = None;
-        self.query_result = None;
-        self.session = Some(adapter(profile.engine).connect(profile, password));
-        self.status = String::from("Connecting to PostgreSQL…");
+        let database = profile.database.clone();
+        self.open_database_session(profile, database, password);
     }
 
     fn refresh_database_events(&mut self) {
         let events = self
-            .session
-            .as_ref()
-            .map(|session| session.drain_events())
-            .unwrap_or_default();
+            .sessions
+            .iter_mut()
+            .flat_map(|(key, session)| {
+                session
+                    .drain_events()
+                    .into_iter()
+                    .map(|event| (key.clone(), event))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-        for event in events {
+        for (key, event) in events {
             match event {
-                DatabaseEvent::Connected => self.status = String::from("Connected to PostgreSQL"),
-                DatabaseEvent::Schemas(schemas) => self.schemas = schemas,
+                DatabaseEvent::Connected => {
+                    self.connecting_sessions.remove(&key);
+                    self.connected_sessions.insert(key.clone());
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.selected_profile_id = Some(key.profile_id);
+                        self.connection_editor_open = false;
+                        self.screen = AppScreen::Workspace;
+                        self.workspace_tab = WorkspaceTab::Sql;
+                        self.status = format!("Connected to {}", key.database);
+                    }
+                }
+                DatabaseEvent::Databases(Ok(databases)) => {
+                    self.database_catalogs.insert(key.profile_id, databases);
+                }
+                DatabaseEvent::Databases(Err(error)) => {
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.status = format!("Could not list databases: {error}");
+                    }
+                }
+                DatabaseEvent::Schemas(schemas) => {
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.schemas = schemas;
+                    }
+                }
                 DatabaseEvent::Tables { schema, tables } => {
-                    if self.selected_schema.as_deref() == Some(&schema) {
+                    if self.active_session_key.as_ref() == Some(&key)
+                        && self.selected_schema.as_deref() == Some(&schema)
+                    {
                         self.tables = tables;
                     }
                 }
                 DatabaseEvent::TableData(Ok(table)) => {
-                    self.table_loading = false;
-                    self.status = format!("Loaded {}.{}", table.schema, table.name);
-                    self.current_table = Some(table);
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.table_loading = false;
+                        self.status = format!("Loaded {}.{}", table.schema, table.name);
+                        self.current_table = Some(table);
+                    }
                 }
                 DatabaseEvent::TableData(Err(error)) => {
-                    self.table_loading = false;
-                    self.status = format!("Could not load table: {error}");
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.table_loading = false;
+                        self.status = format!("Could not load table: {error}");
+                    }
                 }
                 DatabaseEvent::Query(Ok(result)) => {
-                    self.query_running = false;
-                    self.status = result.summary.clone();
-                    self.query_result = Some(result);
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.query_running = false;
+                        self.status = result.summary.clone();
+                        self.query_result = Some(result);
+                    }
                 }
                 DatabaseEvent::Query(Err(error)) => {
-                    self.query_running = false;
-                    self.status = format!("Query failed: {error}");
-                    self.query_result = None;
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.query_running = false;
+                        self.status = format!("Query failed: {error}");
+                        self.query_result = None;
+                    }
                 }
                 DatabaseEvent::Disconnected(error) => {
-                    self.session = None;
-                    self.schemas.clear();
-                    self.tables.clear();
-                    self.selected_schema = None;
-                    self.query_running = false;
-                    self.table_loading = false;
-                    self.current_table = None;
-                    self.status = format!("Disconnected: {error}");
+                    let was_active = self.active_session_key.as_ref() == Some(&key);
+                    self.close_session(&key);
+                    if was_active {
+                        self.status = format!("Disconnected from {}: {error}", key.database);
+                    }
                 }
             }
         }
@@ -559,6 +1170,10 @@ impl SqlManagerApp {
     fn show_table_data(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Table data");
+        let read_only = self.active_session_is_read_only();
+        if read_only {
+            ui.label("Read-only mode is enabled for this connection profile.");
+        }
         if self.table_loading {
             ui.label("Loading table data…");
         }
@@ -573,7 +1188,10 @@ impl SqlManagerApp {
             if ui.button("Reload").clicked() {
                 self.request_table_page(table.offset);
             }
-            if ui.button("Insert row").clicked() {
+            if ui
+                .add_enabled(!read_only, egui::Button::new("Insert row"))
+                .clicked()
+            {
                 self.row_editor = Some(RowEditor {
                     mode: RowEditorMode::Insert,
                     cells: table
@@ -590,13 +1208,22 @@ impl SqlManagerApp {
                 ui.label("Rows are read-only because this table has no primary key.");
             }
             ui.separator();
-            if ui.small_button("Rename table").clicked() {
+            if ui
+                .add_enabled(!read_only, egui::Button::new("Rename table"))
+                .clicked()
+            {
                 requested_schema_action = Some(SchemaAction::RenameTable);
             }
-            if ui.small_button("Drop table").clicked() {
+            if ui
+                .add_enabled(!read_only, egui::Button::new("Drop table"))
+                .clicked()
+            {
                 requested_schema_action = Some(SchemaAction::DropTable);
             }
-            if ui.small_button("Add column").clicked() {
+            if ui
+                .add_enabled(!read_only, egui::Button::new("Add column"))
+                .clicked()
+            {
                 requested_schema_action = Some(SchemaAction::AddColumn);
             }
             egui::ComboBox::from_id_salt("selected_column")
@@ -612,7 +1239,7 @@ impl SqlManagerApp {
                 });
             if ui
                 .add_enabled(
-                    self.selected_column.is_some(),
+                    !read_only && self.selected_column.is_some(),
                     egui::Button::new("Rename column"),
                 )
                 .clicked()
@@ -621,7 +1248,7 @@ impl SqlManagerApp {
             }
             if ui
                 .add_enabled(
-                    self.selected_column.is_some(),
+                    !read_only && self.selected_column.is_some(),
                     egui::Button::new("Drop column"),
                 )
                 .clicked()
@@ -650,10 +1277,16 @@ impl SqlManagerApp {
                         }
                         if !table.primary_key.is_empty() {
                             ui.horizontal(|ui| {
-                                if ui.small_button("Edit").clicked() {
+                                if ui
+                                    .add_enabled(!read_only, egui::Button::new("Edit"))
+                                    .clicked()
+                                {
                                     edit_row = Some(index);
                                 }
-                                if ui.small_button("Delete").clicked() {
+                                if ui
+                                    .add_enabled(!read_only, egui::Button::new("Delete"))
+                                    .clicked()
+                                {
                                     delete_row = Some(index);
                                 }
                             });
@@ -717,7 +1350,7 @@ impl SqlManagerApp {
         let Some(table) = &self.current_table else {
             return;
         };
-        let Some(session) = &self.session else {
+        let Some(session) = self.active_session() else {
             return;
         };
         match session.load_table(table.schema.clone(), table.name.clone(), offset) {
@@ -845,6 +1478,10 @@ impl SqlManagerApp {
     }
 
     fn open_schema_dialog(&mut self, action: SchemaAction) {
+        if self.active_session_is_read_only() {
+            self.status = String::from("Schema changes are disabled in read-only mode");
+            return;
+        }
         let current_table = self.current_table.as_ref();
         let schema = self
             .selected_schema
@@ -1009,6 +1646,10 @@ impl SqlManagerApp {
     }
 
     fn apply_schema_operation(&mut self, dialog: SchemaDialog) {
+        if self.active_session_is_read_only() {
+            self.status = String::from("Schema changes are disabled in read-only mode");
+            return;
+        }
         let sql = match dialog.action {
             SchemaAction::CreateTable => {
                 create_table_sql(&dialog.schema, &dialog.object_name, &dialog.columns)
@@ -1042,7 +1683,11 @@ impl SqlManagerApp {
             }
         };
 
-        let Some(session) = &self.session else {
+        let Some(key) = self.active_session_key.clone() else {
+            self.status = String::from("Connect to PostgreSQL before changing the schema");
+            return;
+        };
+        let Some(session) = self.sessions.get(&key) else {
             self.status = String::from("Connect to PostgreSQL before changing the schema");
             return;
         };
@@ -1064,30 +1709,41 @@ impl SqlManagerApp {
         };
 
         let _ = session.list_tables(schema.clone());
+        if let Some((table, offset)) = &table_to_reload {
+            let _ = session.load_table(schema.clone(), table.clone(), *offset);
+        }
         self.current_table = None;
         self.selected_column = None;
-        if let Some((table, offset)) = table_to_reload {
-            let _ = session.load_table(schema, table, offset);
+        if table_to_reload.is_some() {
             self.table_loading = true;
         }
         self.status = String::from("Applying schema change…");
     }
 
     fn submit_table_mutation(&mut self, sql: String) {
+        if self.active_session_is_read_only() {
+            self.status = String::from("Table changes are disabled in read-only mode");
+            return;
+        }
         let Some(table) = &self.current_table else {
             return;
         };
         let schema = table.schema.clone();
         let name = table.name.clone();
         let offset = table.offset;
-        let Some(session) = &self.session else {
+        let Some(key) = self.active_session_key.clone() else {
             return;
         };
-        match session.execute(sql) {
+        let Some(session) = self.sessions.get(&key) else {
+            return;
+        };
+        let result = session.execute(sql).map(|()| {
+            let _ = session.load_table(schema, name, offset);
+        });
+        match result {
             Ok(()) => {
                 self.query_running = true;
                 self.table_loading = true;
-                let _ = session.load_table(schema, name, offset);
                 self.status = String::from("Saving row…");
             }
             Err(error) => self.status = format!("Could not submit row change: {error}"),
@@ -1240,12 +1896,12 @@ impl SqlManagerApp {
         }
     }
 
-    fn save_connection(&mut self) {
+    fn save_connection(&mut self) -> bool {
         let profile = match self.draft.to_profile(self.selected_profile_id) {
             Ok(profile) => profile,
             Err(error) => {
                 self.status = error;
-                return;
+                return false;
             }
         };
 
@@ -1253,16 +1909,23 @@ impl SqlManagerApp {
             && let Err(error) = secrets::save_password(profile.id, &self.draft.password)
         {
             self.status = format!("Could not save password to the system keyring: {error}");
-            return;
+            return false;
+        }
+
+        if !self.draft.password.is_empty() {
+            self.session_passwords
+                .insert(profile.id, Zeroizing::new(self.draft.password.clone()));
         }
 
         if let Err(error) = storage::save_profile(&profile, &mut self.profiles) {
             self.status = format!("Could not save connection: {error}");
-            return;
+            return false;
         }
 
         self.selected_profile_id = Some(profile.id);
+        self.connection_editor_open = false;
         self.status = format!("Saved connection ‘{}’", profile.name);
+        true
     }
 
     fn start_connection_test(&mut self, context: &egui::Context) {
