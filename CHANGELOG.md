@@ -2,7 +2,16 @@
 
 All notable changes to SQL Manager are documented here.
 
+## [0.4.0] - 2026-09-25
+
+### Features
+
+- Stream results and refresh SQL client UI
 ## [0.3.0] - 2026-09-25
+
+### Chores
+
+- Prepare for v0.3.0
 
 ### Documentation
 
