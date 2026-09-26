@@ -2,7 +2,16 @@
 
 All notable changes to SQL Manager are documented here.
 
+## [0.4.1] - 2026-09-26
+
+### Bug Fixes
+
+- Reduce metadata round trips and show progress
 ## [0.4.0] - 2026-09-25
+
+### Chores
+
+- Prepare for v0.4.0
 
 ### Features
 
