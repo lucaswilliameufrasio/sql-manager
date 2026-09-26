@@ -29,6 +29,7 @@ pub enum Event {
     Databases(Result<Vec<DatabaseInfo>, String>),
     Schemas(Vec<String>),
     Tables { schema: String, tables: Vec<String> },
+    TableDataProgress(TableLoadStage),
     TableData(Result<TableData, String>),
     QueryProgress(QueryOutput),
     Query(Result<QueryOutput, String>),
@@ -60,6 +61,21 @@ pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableLoadStage {
+    Metadata,
+    Rows,
+}
+
+impl TableLoadStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "Reading column and primary-key metadata",
+            Self::Rows => "Loading the first page of rows",
+        }
+    }
 }
 
 enum Command {
@@ -301,7 +317,7 @@ fn run_session<C>(
                     table,
                     offset,
                 } => {
-                    let result = load_table(&client, &schema, &table, offset)
+                    let result = load_table(&client, &schema, &table, offset, &events)
                         .await
                         .map_err(|error| error.to_string());
                     let _ = events.send(Event::TableData(result));
@@ -361,44 +377,49 @@ async fn load_table(
     schema: &str,
     table: &str,
     offset: u64,
+    events: &Sender<Event>,
 ) -> Result<TableData, tokio_postgres::Error> {
-    let column_rows = client
+    let _ = events.send(Event::TableDataProgress(TableLoadStage::Metadata));
+    let metadata_rows = client
         .query(
-            "SELECT column_name, data_type, is_nullable, column_default \
-             FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 \
-             ORDER BY ordinal_position",
+            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+                    kcu.ordinal_position AS primary_key_ordinal \
+             FROM information_schema.columns AS c \
+             LEFT JOIN information_schema.table_constraints AS tc \
+               ON tc.constraint_type = 'PRIMARY KEY' \
+              AND tc.table_schema = c.table_schema \
+              AND tc.table_name = c.table_name \
+             LEFT JOIN information_schema.key_column_usage AS kcu \
+               ON kcu.constraint_catalog = tc.constraint_catalog \
+              AND kcu.constraint_schema = tc.constraint_schema \
+              AND kcu.constraint_name = tc.constraint_name \
+              AND kcu.table_schema = c.table_schema \
+              AND kcu.table_name = c.table_name \
+              AND kcu.column_name = c.column_name \
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
+             ORDER BY c.ordinal_position",
             &[&schema, &table],
         )
         .await?;
-    let columns = column_rows
-        .into_iter()
-        .map(|row| ColumnInfo {
-            name: row.get(0),
+    let mut columns = Vec::with_capacity(metadata_rows.len());
+    let mut primary_key_columns = Vec::new();
+    for row in metadata_rows {
+        let name = row.get::<_, String>(0);
+        if let Some(ordinal_position) = row.get::<_, Option<i32>>(4) {
+            primary_key_columns.push((ordinal_position, name.clone()));
+        }
+        columns.push(ColumnInfo {
+            name,
             data_type: row.get(1),
             nullable: row.get::<_, String>(2) == "YES",
             default: row.get(3),
-        })
-        .collect::<Vec<_>>();
-
-    let key_rows = client
-        .query(
-            "SELECT kcu.column_name \
-             FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu \
-               ON tc.constraint_name = kcu.constraint_name \
-              AND tc.table_schema = kcu.table_schema \
-              AND tc.table_name = kcu.table_name \
-             WHERE tc.constraint_type = 'PRIMARY KEY' \
-               AND tc.table_schema = $1 AND tc.table_name = $2 \
-             ORDER BY kcu.ordinal_position",
-            &[&schema, &table],
-        )
-        .await?;
-    let primary_key = key_rows
+        });
+    }
+    primary_key_columns.sort_by_key(|(ordinal_position, _)| *ordinal_position);
+    let primary_key = primary_key_columns
         .into_iter()
-        .map(|row| row.get(0))
-        .collect::<Vec<String>>();
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
 
     let order_by = if primary_key.is_empty() {
         String::new()
@@ -420,6 +441,7 @@ async fn load_table(
         TABLE_PAGE_SIZE + 1,
         offset
     );
+    let _ = events.send(Event::TableDataProgress(TableLoadStage::Rows));
     let messages = client.simple_query(&query).await?;
     let mut result_columns = Vec::new();
     let mut rows = Vec::new();
@@ -717,7 +739,9 @@ impl QueryAccumulator {
 mod tests {
     use std::{env, time::Instant};
 
-    use super::{Event, PostgresSession, QueryOutput, validate_read_only_sql};
+    use super::{
+        Event, PostgresSession, QueryOutput, TableData, TableLoadStage, validate_read_only_sql,
+    };
     use crate::connection::{ConnectionDraft, ConnectionProfile};
 
     #[test]
@@ -844,6 +868,76 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires SQL_MANAGER_E2E_DATABASE_URL and a local PostgreSQL server"]
+    fn postgres_e2e_measures_first_and_repeat_table_page_loads() {
+        let mut draft = ConnectionDraft {
+            connection_url: env::var("SQL_MANAGER_E2E_DATABASE_URL")
+                .expect("set SQL_MANAGER_E2E_DATABASE_URL"),
+            ..ConnectionDraft::default()
+        };
+        draft
+            .apply_connection_url()
+            .expect("valid PostgreSQL E2E URL");
+        let password = draft.password.clone();
+        let profile = draft.to_profile(None).expect("valid profile");
+        let table_name = format!("e2e_table_{}", uuid::Uuid::new_v4().simple());
+
+        let setup_session = connect_e2e_session(profile.clone(), &password);
+        run_e2e_session_query(
+            &setup_session,
+            &format!(
+                "CREATE TABLE public.{table_name} (id bigint PRIMARY KEY, payload text NOT NULL); \
+                 INSERT INTO public.{table_name} \
+                 SELECT value, md5(value::text) FROM generate_series(1, 100000) AS value"
+            ),
+        )
+        .expect("create and seed table E2E fixture");
+        drop(setup_session);
+
+        let session = connect_e2e_session(profile, &password);
+        wait_for_schema_list(&session);
+        session
+            .list_tables(String::from("public"))
+            .expect("list E2E fixture tables");
+        loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("table catalog should load")
+            {
+                Event::Tables { schema, tables } if schema == "public" => {
+                    assert!(tables.contains(&table_name));
+                    break;
+                }
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        }
+
+        let first_start = Instant::now();
+        let (first_page, first_stages) = run_e2e_table_load(&session, &table_name);
+        let first_elapsed = first_start.elapsed();
+        let repeat_start = Instant::now();
+        let (repeat_page, repeat_stages) = run_e2e_table_load(&session, &table_name);
+        let repeat_elapsed = repeat_start.elapsed();
+
+        assert_eq!(first_page.rows.len(), crate::schema::TABLE_PAGE_SIZE);
+        assert_eq!(repeat_page.rows.len(), crate::schema::TABLE_PAGE_SIZE);
+        assert!(first_page.has_more && repeat_page.has_more);
+        assert_eq!(
+            first_stages,
+            vec![TableLoadStage::Metadata, TableLoadStage::Rows]
+        );
+        assert_eq!(first_stages, repeat_stages);
+        eprintln!(
+            "First table data page: {first_elapsed:?}; same-session reload: {repeat_elapsed:?}"
+        );
+
+        run_e2e_session_query(&session, &format!("DROP TABLE public.{table_name}"))
+            .expect("clean up table E2E fixture");
+    }
+
     fn execute_e2e_query(
         profile: ConnectionProfile,
         password: &str,
@@ -885,6 +979,44 @@ mod tests {
             }
         }
         session
+    }
+
+    fn wait_for_schema_list(session: &PostgresSession) {
+        loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("schema catalog should load")
+            {
+                Event::Schemas(_) => return,
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn run_e2e_table_load(
+        session: &PostgresSession,
+        table: &str,
+    ) -> (TableData, Vec<TableLoadStage>) {
+        session
+            .load_table(String::from("public"), table.to_owned(), 0)
+            .expect("submit table data load");
+        let mut stages = Vec::new();
+        loop {
+            match session
+                .events
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("table page should load")
+            {
+                Event::TableDataProgress(stage) => stages.push(stage),
+                Event::TableData(result) => {
+                    return (result.expect("table data load should succeed"), stages);
+                }
+                Event::Disconnected(error) => panic!("database session disconnected: {error}"),
+                _ => {}
+            }
+        }
     }
 
     fn assert_bounded_result(output: &QueryOutput) {

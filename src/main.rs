@@ -17,7 +17,7 @@ use std::{
 
 use backup::{decrypt_profiles, encrypt_profiles};
 use connection::{ConnectionDraft, ConnectionProfile, TlsMode};
-use database::{DatabaseInfo, Event as DatabaseEvent, QueryOutput};
+use database::{DatabaseInfo, Event as DatabaseEvent, QueryOutput, TableLoadStage};
 use eframe::egui;
 use engine::{DatabaseSession, adapter};
 use rfd::FileDialog;
@@ -114,6 +114,8 @@ struct SqlManagerApp {
     query_elapsed: Option<Duration>,
     current_table: Option<TableData>,
     table_loading: bool,
+    table_loading_stage: Option<TableLoadStage>,
+    table_load_started_at: Option<Instant>,
     row_editor: Option<RowEditor>,
     pending_delete_row: Option<usize>,
     schema_dialog: Option<SchemaDialog>,
@@ -220,6 +222,8 @@ impl Default for SqlManagerApp {
             query_elapsed: None,
             current_table: None,
             table_loading: false,
+            table_loading_stage: None,
+            table_load_started_at: None,
             row_editor: None,
             pending_delete_row: None,
             schema_dialog: None,
@@ -265,10 +269,11 @@ impl eframe::App for SqlManagerApp {
                                 egui::RichText::new("●")
                                     .color(egui::Color32::from_rgb(105, 207, 157)),
                             );
+                            let full_session_name = format!("{active_name} / {}", key.database);
                             ui.label(
-                                egui::RichText::new(format!("{active_name} / {}", key.database))
-                                    .strong(),
-                            );
+                                egui::RichText::new(compact_label(&full_session_name, 42)).strong(),
+                            )
+                            .on_hover_text(full_session_name);
                             if self.active_session_is_read_only() {
                                 ui.label(
                                     egui::RichText::new("READ ONLY")
@@ -415,13 +420,17 @@ impl eframe::App for SqlManagerApp {
                     let mut activate = None;
                     for (key, label) in open_sessions {
                         let connected = self.connected_sessions.contains(&key);
-                        let label = if connected {
-                            label
+                        let display_label = if connected {
+                            compact_label(&label, 30)
                         } else {
-                            format!("{label} · Connecting…")
+                            format!("◌  {} · Connecting", compact_label(&label, 30))
                         };
                         if ui
-                            .selectable_label(self.active_session_key.as_ref() == Some(&key), label)
+                            .selectable_label(
+                                self.active_session_key.as_ref() == Some(&key),
+                                display_label,
+                            )
+                            .on_hover_text(label)
                             .clicked()
                         {
                             activate = Some(key);
@@ -458,13 +467,17 @@ impl eframe::App for SqlManagerApp {
                     let mut requested_session = None;
                     for (key, label) in open_sessions {
                         let connected = self.connected_sessions.contains(&key);
-                        let label = if connected {
-                            format!("●  {label}")
+                        let display_label = if connected {
+                            format!("●  {}", compact_label(&label, 30))
                         } else {
-                            format!("◌  {label} · Connecting")
+                            format!("◌  {} · Connecting", compact_label(&label, 30))
                         };
                         if ui
-                            .selectable_label(self.active_session_key.as_ref() == Some(&key), label)
+                            .selectable_label(
+                                self.active_session_key.as_ref() == Some(&key),
+                                display_label,
+                            )
+                            .on_hover_text(label)
                             .clicked()
                         {
                             requested_session = Some(key);
@@ -602,17 +615,11 @@ impl eframe::App for SqlManagerApp {
                         ui.separator();
                         ui.label(table);
                         if ui.button("View Data").clicked()
-                            && let (Some(session), Some(schema)) =
-                                (self.active_session(), self.selected_schema.clone())
+                            && let Some(schema) = self.selected_schema.clone()
                         {
-                            match session.load_table(schema, table.clone(), 0) {
-                                Ok(()) => {
-                                    self.table_loading = true;
-                                    self.workspace_tab = WorkspaceTab::TableData;
-                                }
-                                Err(error) => {
-                                    self.status = format!("Could not open table data: {error}");
-                                }
+                            self.start_table_page_load(schema, table.clone(), 0);
+                            if self.table_loading {
+                                self.workspace_tab = WorkspaceTab::TableData;
                             }
                         }
                     }
@@ -656,9 +663,14 @@ impl eframe::App for SqlManagerApp {
                     .fill(egui::Color32::from_rgb(20, 22, 28))
                     .inner_margin(egui::Margin::same(22)),
             )
-            .show(ui, |ui| match self.screen {
-                AppScreen::Connections => self.show_connection_manager(ui),
-                AppScreen::Workspace => self.show_workspace(ui),
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("workspace_page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.screen {
+                        AppScreen::Connections => self.show_connection_manager(ui),
+                        AppScreen::Workspace => self.show_workspace(ui),
+                    });
             });
 
         self.show_backup_dialog(ui.ctx());
@@ -702,6 +714,8 @@ impl SqlManagerApp {
         self.query_elapsed = None;
         self.current_table = None;
         self.table_loading = false;
+        self.table_loading_stage = None;
+        self.table_load_started_at = None;
         self.row_editor = None;
         self.pending_delete_row = None;
         self.schema_dialog = None;
@@ -1367,6 +1381,12 @@ impl SqlManagerApp {
 
         for (result_index, result_set) in result.result_sets.iter().enumerate() {
             if !result_set.columns.is_empty() {
+                let available_width = ui.available_width().max(360.0);
+                let column_width = if result_set.columns.len() == 1 {
+                    available_width
+                } else {
+                    (available_width / result_set.columns.len() as f32).clamp(150.0, 320.0)
+                };
                 egui::ScrollArea::both()
                     .id_salt(("query_result", result_index))
                     .max_height(360.0)
@@ -1378,22 +1398,22 @@ impl SqlManagerApp {
                                     if row_index == 0 {
                                         for column in &result_set.columns {
                                             ui.add_sized(
-                                                [160.0, 24.0],
+                                                [column_width, 24.0],
                                                 egui::Label::new(
                                                     egui::RichText::new(column).strong(),
                                                 )
                                                 .truncate(),
-                                            );
+                                            )
+                                            .on_hover_text(column);
                                         }
                                     } else if let Some(row) = result_set.rows.get(row_index - 1) {
                                         for value in row {
+                                            let text = value.as_deref().unwrap_or("NULL");
                                             ui.add_sized(
-                                                [160.0, 24.0],
-                                                egui::Label::new(
-                                                    value.as_deref().unwrap_or("NULL"),
-                                                )
-                                                .truncate(),
-                                            );
+                                                [column_width, 24.0],
+                                                egui::Label::new(text).truncate(),
+                                            )
+                                            .on_hover_text(text);
                                         }
                                     }
                                     ui.end_row();
@@ -1496,17 +1516,50 @@ impl SqlManagerApp {
                         self.tables = tables;
                     }
                 }
+                DatabaseEvent::TableDataProgress(stage) => {
+                    if self.active_session_key.as_ref() == Some(&key) {
+                        self.table_loading_stage = Some(stage);
+                    }
+                }
                 DatabaseEvent::TableData(Ok(table)) => {
                     if self.active_session_key.as_ref() == Some(&key) {
                         self.table_loading = false;
-                        self.status = format!("Loaded {}.{}", table.schema, table.name);
+                        self.table_loading_stage = None;
+                        let elapsed = self
+                            .table_load_started_at
+                            .take()
+                            .map(|start| start.elapsed());
+                        self.status = elapsed.map_or_else(
+                            || format!("Loaded {}.{}", table.schema, table.name),
+                            |elapsed| {
+                                format!(
+                                    "Loaded {}.{} · {:.2}s",
+                                    table.schema,
+                                    table.name,
+                                    elapsed.as_secs_f64()
+                                )
+                            },
+                        );
                         self.current_table = Some(table);
                     }
                 }
                 DatabaseEvent::TableData(Err(error)) => {
                     if self.active_session_key.as_ref() == Some(&key) {
                         self.table_loading = false;
-                        self.status = format!("Could not load table: {error}");
+                        self.table_loading_stage = None;
+                        let elapsed = self
+                            .table_load_started_at
+                            .take()
+                            .map(|start| start.elapsed());
+                        self.status = elapsed.map_or_else(
+                            || format!("Could not load table: {error}"),
+                            |elapsed| {
+                                format!(
+                                    "Could not load table after {:.2}s: {error}",
+                                    elapsed.as_secs_f64()
+                                )
+                            },
+                        );
                     }
                 }
                 DatabaseEvent::QueryProgress(result) => {
@@ -1560,7 +1613,20 @@ impl SqlManagerApp {
             ui.label("Read-only mode is enabled for this connection profile.");
         }
         if self.table_loading {
-            ui.label("Loading table data…");
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    self.table_loading_stage
+                        .map(TableLoadStage::label)
+                        .unwrap_or("Starting table data request"),
+                );
+                if let Some(started) = self.table_load_started_at {
+                    ui.label(
+                        egui::RichText::new(format!("{:.1}s", started.elapsed().as_secs_f32()))
+                            .weak(),
+                    );
+                }
+            });
         }
 
         let Some(table) = self.current_table.clone() else {
@@ -1735,12 +1801,23 @@ impl SqlManagerApp {
         let Some(table) = &self.current_table else {
             return;
         };
-        let Some(session) = self.active_session() else {
-            return;
-        };
-        match session.load_table(table.schema.clone(), table.name.clone(), offset) {
-            Ok(()) => self.table_loading = true,
-            Err(error) => self.status = format!("Could not load table page: {error}"),
+        let schema = table.schema.clone();
+        let name = table.name.clone();
+        self.start_table_page_load(schema, name, offset);
+    }
+
+    fn start_table_page_load(&mut self, schema: String, table: String, offset: u64) {
+        let result = self
+            .active_session()
+            .map(|session| session.load_table(schema, table, offset));
+        match result {
+            Some(Ok(())) => {
+                self.table_loading = true;
+                self.table_loading_stage = Some(TableLoadStage::Metadata);
+                self.table_load_started_at = Some(Instant::now());
+            }
+            Some(Err(error)) => self.status = format!("Could not load table page: {error}"),
+            None => self.status = String::from("Open a database session before loading table data"),
         }
     }
 
@@ -2101,6 +2178,8 @@ impl SqlManagerApp {
         self.selected_column = None;
         if table_to_reload.is_some() {
             self.table_loading = true;
+            self.table_loading_stage = Some(TableLoadStage::Metadata);
+            self.table_load_started_at = Some(Instant::now());
         }
         self.status = String::from("Applying schema change…");
     }
@@ -2129,6 +2208,8 @@ impl SqlManagerApp {
             Ok(()) => {
                 self.query_running = true;
                 self.table_loading = true;
+                self.table_loading_stage = Some(TableLoadStage::Metadata);
+                self.table_load_started_at = Some(Instant::now());
                 self.status = String::from("Saving row…");
             }
             Err(error) => self.status = format!("Could not submit row change: {error}"),
@@ -2389,6 +2470,19 @@ fn schema_action_title(action: SchemaAction) -> &'static str {
     }
 }
 
+fn compact_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let compact = chars
+        .by_ref()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        value.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod ui_tests {
     use std::{env, thread, time::Instant};
@@ -2429,6 +2523,50 @@ mod ui_tests {
             "a 1,000-row result created {} paint shapes; rows should be virtualized",
             paint_shape_count
         );
+    }
+
+    #[test]
+    fn workspace_scrolls_when_editor_and_results_exceed_window_height() {
+        let key = super::SessionKey {
+            profile_id: uuid::Uuid::new_v4(),
+            database: String::from("test"),
+        };
+        let mut app = SqlManagerApp {
+            screen: super::AppScreen::Workspace,
+            active_session_key: Some(key.clone()),
+            connected_sessions: std::collections::HashSet::from([key]),
+            query_result: Some(QueryOutput {
+                summary: String::from("1,000 rows returned"),
+                result_sets: vec![ResultSet {
+                    columns: vec![String::from("id"), String::from("payload")],
+                    rows: (0..1_000)
+                        .map(|index| vec![Some(index.to_string()), Some(String::from("value"))])
+                        .collect(),
+                    truncated: true,
+                }],
+            }),
+            ..SqlManagerApp::default()
+        };
+
+        let context = egui::Context::default();
+        apply_app_theme(&context);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_100.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            let page = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| app.show_workspace(ui));
+            assert!(
+                page.content_size.y > page.inner_rect.height(),
+                "short workspace viewport did not expose a vertical scroll range"
+            );
+        });
+        output.drop_without_applying_deltas();
     }
 
     #[test]
