@@ -25,6 +25,9 @@ operations can create, rename, and restrict-drop tables and add, rename, and
 restrict-drop columns; column types come from a fixed allowlist.
 macOS and Linux are the initial target platforms.
 
+Known UI observations and reproduction steps are tracked in
+[`docs/visual-qa-findings.md`](docs/visual-qa-findings.md).
+
 For PostgreSQL, paste a `postgresql://` or `postgres://` connection URL into the
 connection form and choose **Fill fields**. You can also click Connect or Test
 directly after pasting; the URL fields are parsed automatically. URL-encoded
