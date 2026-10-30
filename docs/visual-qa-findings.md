@@ -99,3 +99,35 @@ Not visually verified: connected result grid/query workflow, keyring/backup and
 native dialogs, 150% DPI, light theme, actual GPU, Wayland or macOS. Release
 packaging was not run. The owned GUI and disposable test database were stopped;
 no application implementation or production data was changed.
+
+## Follow-up run — 2026-10-30 (native Wayland, real GPU)
+
+Revision: release build of the checkout at the time (v0.4.0); eframe 0.36.2, glow, private
+KWin 6.8.1 `--virtual` session on the real NVIDIA GPU (not software). Private HOME and
+private `ksecretd` wallet (throwaway password); disposable `postgres:18.6-alpine`
+with 60 synthetic `customers` rows. Screenshots stay in the operator's private scratch area.
+
+- **VQA-001 reproduces on native Wayland** with the real GPU: the header mark, New, Create
+  connection and Backup symbols are empty squares. It is not specific to Xvfb/llvmpipe.
+- **Newly covered and passing:** Fill fields from a pasted URL (`sslmode=disable` parsed);
+  Test connection (green, PostgreSQL 18.6 banner); Save and connect with a working keyring;
+  SQL editor; `Run query` returned 50 rows in 0.02s; the grid kept `São Paulo` and `Belém`;
+  pasted SQL containing `São João ação` read back correctly; Export encrypted backup opens
+  an in-app modal, then a native GTK file chooser, and the file is written.
+- **Keyring failure is readable:** without a Secret Service, Save and connect shows
+  `Could not save password to the system keyring: ...` in red and does not connect.
+  A running but unprepared Secret Service gave
+  `Couldn't access platform storage: SS error: result not returned from SS API`.
+- **VQA-004 — Export backup modal is anchored top-left**, covering the SQL Manager header,
+  instead of centered. Priority low; confirm intended placement.
+- **VQA-005 — Last result column is clipped** (`observação longa obser…`) at the panel edge in
+  a wide result. A horizontal scrollbar line exists; confirm it is discoverable.
+- **VQA-006 — Observed hang, not reproduced reliably:** in two runs the session stayed on
+  `Connecting to vqa…` for 16s+ with no mouse movement; a third identical run connected.
+  Unexplained; could be a stale frame (egui repaints on events) or a real delay. Retest with
+  logging before treating as a defect.
+- **Window size:** the app opens 1360x860 inner plus decorations, which does not fit a
+  1360x860 screen; a 1366x768 laptop would show the same (status bar off-screen). Consider a
+  size derived from the monitor.
+- **Not established:** the `Table Data` tab did not respond to one click without a selected
+  table; not investigated. Light theme unsupported (forced dark). 150% DPI not run here.
